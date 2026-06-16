@@ -566,7 +566,7 @@ mod graph_tests {
         ident::AssetIdent,
         module::{Module, ModuleSideEffects},
         module_graph::{
-            GraphEntries, ModuleGraph, SingleModuleGraph,
+            GraphEntries, ModuleGraph, ModuleGraphOptions, SingleModuleGraph,
             chunk_group_info::{ChunkGroupEntry, EntryHeuristics},
         },
         reference::{ModuleReference, ModuleReferences, SingleChunkableModuleReference},
@@ -709,8 +709,10 @@ mod graph_tests {
                 }],
                 vec![],
             )),
-            false,
-            true,
+            ModuleGraphOptions {
+                include_binding_usage: true,
+                ..Default::default()
+            },
         );
         let graph = ModuleGraph::from_graphs(vec![single_graph], None);
         let binding_usage = compute_binding_usage_info(graph, false).connect().await?;
