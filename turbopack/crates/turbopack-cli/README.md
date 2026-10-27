@@ -97,7 +97,7 @@ either tree. Use a separate directory such as a sibling of the project.
 
 ### Module dependencies and environment
 
-Versioned pure-Go dependencies must already be in `GOMODCACHE`. Builds disable
+Versioned dependencies that do not require CGO must already be in `GOMODCACHE`. Builds disable
 downloads and use `-mod=readonly`; missing dependencies or checksums produce
 Go diagnostics without modifying `go.mod` or `go.sum`.
 
@@ -148,8 +148,9 @@ for the integration design.
 
 ### Current limitations
 
-- Native host executables only, with CGO disabled. Application code and dependencies
-  must be pure Go; standard-library implementations may use assembly.
+- Native host executables only, with CGO disabled. Imported packages may contain
+  Go assembly, local assembly headers and system object files; packages requiring
+  CGO are unsupported.
 - Inputs are filenames, not package paths or patterns. Go and JavaScript inputs
   cannot be mixed in one invocation.
 - Module replacements (all `replace` directives), project Go workspaces, vendoring,
