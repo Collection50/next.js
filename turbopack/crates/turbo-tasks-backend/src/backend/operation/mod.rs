@@ -1186,6 +1186,13 @@ impl<'e> ExecuteContext<'e> {
             collector(task.id());
         }
     }
+
+    /// Whether this is a GC context, i.e. [`Self::note_maybe_collectible`] reports to a collector.
+    /// [`ChildExecuteContext::create`] does not carry the collector over.
+    pub fn has_gc_collectible(&self) -> bool {
+        self.gc_collectible.is_some()
+    }
+
     pub fn should_track_dependencies(&self) -> bool {
         self.backend.should_track_dependencies()
     }
@@ -1242,6 +1249,7 @@ impl<'e> ExecuteContext<'e> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct ChildExecuteContext<'e> {
     backend: &'e TurboTasksBackend,
     turbo_tasks: &'e TurboTasks<TurboTasksBackend>,
@@ -1249,6 +1257,15 @@ pub struct ChildExecuteContext<'e> {
 }
 
 impl<'e> ChildExecuteContext<'e> {
+    /// Like [`ExecuteContext::with_current_task_priority`]: the created contexts return `priority`
+    /// from [`ExecuteContext::get_current_task_priority`]. Needed when they run on other threads
+    /// than the calling task, e.g. in a parallel operation, where the task-local task state is not
+    /// available.
+    pub(super) fn with_current_task_priority(mut self, priority: TaskPriority) -> Self {
+        self.current_task_priority = Some(priority);
+        self
+    }
+
     pub fn create(self) -> ExecuteContext<'e> {
         ExecuteContext {
             backend: self.backend,

@@ -17,7 +17,7 @@ use std::{
     mem::take,
     num::NonZeroU32,
     ops::ControlFlow,
-    thread::yield_now,
+    thread::{self, yield_now},
     time::{Duration, Instant},
 };
 
@@ -26,6 +26,10 @@ use indexmap::map::Entry;
 use ringmap::RingSet;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use smallvec::{SmallVec, smallvec};
+use tokio::{
+    runtime::{Handle, RuntimeFlavor},
+    task::block_in_place,
+};
 #[cfg(feature = "trace_aggregation_update_queue")]
 use tracing::span::Span;
 #[cfg(any(
@@ -35,7 +39,9 @@ use tracing::span::Span;
 use tracing::trace_span;
 #[cfg(feature = "task_dirty_cause")]
 use turbo_tasks::TaskDirtyCause;
-use turbo_tasks::{FxIndexMap, TaskExecutionReason, TaskId, TaskPriority, event::EventDescription};
+use turbo_tasks::{
+    FxIndexMap, TaskExecutionReason, TaskId, TaskPriority, event::EventDescription, parallel,
+};
 
 use crate::{
     backend::{
@@ -68,6 +74,16 @@ const MAX_OPTIMIZE_QUEUE_SIZE: usize = 10000;
 /// over its lifetime. Once exhausted, queued and newly pushed `OptimizeJob`s are dropped
 /// the same way as when `MAX_OPTIMIZE_QUEUE_SIZE` is reached.
 const MAX_OPTIMIZATIONS_PER_QUEUE: usize = 1000;
+/// Number of queued `jobs` at which a queue runs all of them in parallel instead of one by one.
+/// See [`AggregationUpdateQueue::fan_out`].
+///
+/// A single queue is processed by a single thread, and an update can cascade into millions of
+/// jobs. While such a cascade runs, removals in other queues that overtake its additions keep
+/// retrying (see [`retry_loop`]). Running large batches in parallel shortens the cascade. Smaller
+/// batches are not worth the overhead of the parallel call. Edge removals are queued separately
+/// and never fan out: in parallel, their retries would occupy the threads that run the additions
+/// they wait for.
+const JOB_FAN_OUT_THRESHOLD: usize = 4096;
 #[cfg(not(feature = "trace_aggregation_update"))]
 const AGGREGATION_UPDATE_CATEGORY: TaskDataCategory = TaskDataCategory::Meta;
 #[cfg(feature = "trace_aggregation_update")]
@@ -319,6 +335,18 @@ pub enum AggregationUpdateJob {
 }
 
 impl AggregationUpdateJob {
+    /// Whether this job removes edges: these jobs wait for missing edges (see [`retry_loop`]) and
+    /// are queued separately (see `AggregationUpdateQueue::edge_removal_jobs`).
+    fn is_edge_removal(&self) -> bool {
+        matches!(
+            self,
+            AggregationUpdateJob::InnerOfUpperLostFollower { .. }
+                | AggregationUpdateJob::InnerOfUppersLostFollower { .. }
+                | AggregationUpdateJob::InnerOfUppersLostFollowers(_)
+                | AggregationUpdateJob::InnerOfUpperLostFollowers { .. }
+        )
+    }
+
     pub fn data_update(
         task: &mut TaskGuard<'_>,
         update: AggregatedDataUpdate,
@@ -880,10 +908,56 @@ pub struct AggregationUpdateQueueStats {
     schedule_task: usize,
 }
 
+#[cfg(feature = "trace_aggregation_update_stats")]
+impl AggregationUpdateQueueStats {
+    /// Adds the counts of `other`, e.g. of a fan-out buffer.
+    fn add(&mut self, other: Self) {
+        let Self {
+            new_followers,
+            inner_of_upper_has_new_follower,
+            inner_of_uppers_has_new_follower,
+            inner_of_upper_has_new_followers,
+            lost_followers,
+            inner_of_upper_lost_follower,
+            inner_of_upper_lost_followers,
+            inner_of_uppers_lost_follower,
+            balance_edge,
+            balance_edge_batches,
+            update_aggregation_number,
+            update_aggregation_number_batches,
+            optimize_task,
+            aggregated_data_update,
+            find_and_schedule_dirty_batches,
+            find_and_schedule_dirty,
+            schedule_task,
+        } = other;
+        self.new_followers += new_followers;
+        self.inner_of_upper_has_new_follower += inner_of_upper_has_new_follower;
+        self.inner_of_uppers_has_new_follower += inner_of_uppers_has_new_follower;
+        self.inner_of_upper_has_new_followers += inner_of_upper_has_new_followers;
+        self.lost_followers += lost_followers;
+        self.inner_of_upper_lost_follower += inner_of_upper_lost_follower;
+        self.inner_of_upper_lost_followers += inner_of_upper_lost_followers;
+        self.inner_of_uppers_lost_follower += inner_of_uppers_lost_follower;
+        self.balance_edge += balance_edge;
+        self.balance_edge_batches += balance_edge_batches;
+        self.update_aggregation_number += update_aggregation_number;
+        self.update_aggregation_number_batches += update_aggregation_number_batches;
+        self.optimize_task += optimize_task;
+        self.aggregated_data_update += aggregated_data_update;
+        self.find_and_schedule_dirty_batches += find_and_schedule_dirty_batches;
+        self.find_and_schedule_dirty += find_and_schedule_dirty;
+        self.schedule_task += schedule_task;
+    }
+}
+
 /// A queue for aggregation update jobs.
-#[derive(Default)]
 pub struct AggregationUpdateQueue {
     jobs: VecDeque<AggregationUpdateJobItem>,
+    /// Jobs that remove follower or upper edges. They run only after `jobs`,
+    /// `aggregation_number_updates` and `balance_queue` are empty, and never fan out. See
+    /// [`Self::pop_job`].
+    edge_removal_jobs: VecDeque<AggregationUpdateJobItem>,
     aggregation_number_updates: FxIndexMap<TaskId, AggregationNumberUpdate>,
     done_aggregation_number_updates: FxHashMap<TaskId, AggregationNumberUpdate>,
     find_and_schedule: FxRingSet<FindAndScheduleJob>,
@@ -893,8 +967,21 @@ pub struct AggregationUpdateQueue {
     /// `MAX_OPTIMIZATIONS_PER_QUEUE`.
     optimizations_executed: usize,
     scheduled_tasks: FxHashMap<TaskId, TaskPriority>,
+    /// Whether large batches of `jobs` run in parallel, see [`Self::fan_out`]. Off for GC queues
+    /// and for the buffers of a fan-out.
+    allow_fan_out: bool,
+    /// Backs off removals that make no progress, see [`RemovalBackoff`].
+    removal_backoff: RemovalBackoff,
+    /// A back-off due before the next removal, see [`Self::removal_backoff_before`].
+    pending_removal_backoff: Option<Duration>,
     #[cfg(feature = "trace_aggregation_update_stats")]
     pub stats: AggregationUpdateQueueStats,
+}
+
+impl Default for AggregationUpdateQueue {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AggregationUpdateQueue {
@@ -902,6 +989,7 @@ impl AggregationUpdateQueue {
     pub fn new() -> Self {
         Self {
             jobs: VecDeque::with_capacity(0),
+            edge_removal_jobs: VecDeque::with_capacity(0),
             aggregation_number_updates: FxIndexMap::default(),
             done_aggregation_number_updates: FxHashMap::default(),
             find_and_schedule: FxRingSet::default(),
@@ -909,6 +997,9 @@ impl AggregationUpdateQueue {
             optimize_queue: FxRingSet::default(),
             optimizations_executed: 0,
             scheduled_tasks: FxHashMap::default(),
+            allow_fan_out: true,
+            removal_backoff: RemovalBackoff::default(),
+            pending_removal_backoff: None,
             #[cfg(feature = "trace_aggregation_update_stats")]
             stats: AggregationUpdateQueueStats::default(),
         }
@@ -916,10 +1007,27 @@ impl AggregationUpdateQueue {
 
     /// A queue that defers every optimization: each request is recorded on its task's
     /// `optimization_pending` flag instead of being enqueued.
+    ///
+    /// It never fans out: GC uses it, and GC contexts report collectible tasks through a callback
+    /// that the child contexts of a fan-out don't have.
     pub fn new_without_optimizations() -> Self {
         Self {
             // Start the budget already spent, so every optimization is refused.
             optimizations_executed: MAX_OPTIMIZATIONS_PER_QUEUE,
+            allow_fan_out: false,
+            ..Self::new()
+        }
+    }
+
+    /// A buffer for one chunk of a fan-out: it receives the work generated by the chunk's jobs, and
+    /// is never processed itself. See [`Self::fan_out`].
+    ///
+    /// It starts with this queue's optimization budget, so it refuses an optimization exactly when
+    /// this queue would. It executes no optimizations, so the budget is only spent by this queue.
+    fn buffer(&self) -> Self {
+        Self {
+            optimizations_executed: self.optimizations_executed,
+            allow_fan_out: false,
             ..Self::new()
         }
     }
@@ -928,6 +1036,7 @@ impl AggregationUpdateQueue {
     pub fn is_empty(&self) -> bool {
         let Self {
             jobs,
+            edge_removal_jobs,
             aggregation_number_updates,
             find_and_schedule,
             balance_queue,
@@ -935,10 +1044,14 @@ impl AggregationUpdateQueue {
             optimizations_executed: _,
             done_aggregation_number_updates: _,
             scheduled_tasks,
+            allow_fan_out: _,
+            removal_backoff: _,
+            pending_removal_backoff: _,
             #[cfg(feature = "trace_aggregation_update_stats")]
                 stats: _,
         } = self;
         jobs.is_empty()
+            && edge_removal_jobs.is_empty()
             && aggregation_number_updates.is_empty()
             && find_and_schedule.is_empty()
             && balance_queue.is_empty()
@@ -954,55 +1067,135 @@ impl AggregationUpdateQueue {
                 base_aggregation_number,
                 distance,
             } => {
-                match self.aggregation_number_updates.entry(task_id) {
-                    Entry::Occupied(mut entry) => {
-                        let update = entry.get_mut();
-                        update.base_aggregation_number =
-                            max(update.base_aggregation_number, base_aggregation_number);
-                        if let Some(distance) = distance {
-                            if let Some(update_distance) = update.distance.as_mut() {
-                                *update_distance = max(*update_distance, distance);
-                            } else {
-                                update.distance = Some(distance);
-                            }
-                        }
-                    }
-                    Entry::Vacant(entry) => {
-                        match self.done_aggregation_number_updates.entry(task_id) {
-                            HashMapEntry::Occupied(mut entry) => {
-                                let update = entry.get_mut();
-                                let change =
-                                    if update.base_aggregation_number < base_aggregation_number {
-                                        true
-                                    } else if let Some(distance) = distance {
-                                        update.distance.is_none_or(|d| d < distance)
-                                    } else {
-                                        false
-                                    };
-                                if !change {
-                                    return;
-                                }
-                                entry.remove();
-                            }
-                            HashMapEntry::Vacant(_) => {}
-                        }
-                        entry.insert(AggregationNumberUpdate {
-                            base_aggregation_number,
-                            distance,
-                            #[cfg(feature = "trace_aggregation_update_queue")]
-                            span: Some(Span::current()),
-                        });
-                    }
-                };
+                self.push_aggregation_number_update(
+                    task_id,
+                    AggregationNumberUpdate {
+                        base_aggregation_number,
+                        distance,
+                        #[cfg(feature = "trace_aggregation_update_queue")]
+                        span: Some(Span::current()),
+                    },
+                );
             }
             AggregationUpdateJob::BalanceEdge { upper_id, task_id } => {
                 self.balance_queue
                     .push_back(BalanceJob::new(upper_id, task_id));
             }
+            AggregationUpdateJob::InnerOfUpperLostFollower { .. }
+            | AggregationUpdateJob::InnerOfUppersLostFollower { .. }
+            | AggregationUpdateJob::InnerOfUppersLostFollowers(_)
+            | AggregationUpdateJob::InnerOfUpperLostFollowers { .. } => {
+                debug_assert!(job.is_edge_removal());
+                self.edge_removal_jobs
+                    .push_back(AggregationUpdateJobItem::new(job));
+            }
             _ => {
                 self.jobs.push_back(AggregationUpdateJobItem::new(job));
             }
         }
+    }
+
+    /// Takes the next job for [`Self::process_step`], if a job is due before the other queues.
+    ///
+    /// Edge removals can overtake the additions they remove (see [`retry_loop`]) and are then
+    /// requeued. They are only taken once `jobs`, `aggregation_number_updates` and `balance_queue`
+    /// are empty, so that requeued removals don't keep that work from running. That work includes
+    /// creating edges: follower edges created when a task becomes an aggregating node, edges
+    /// converted by `balance_edge`, and the follow-up additions of both. Removals still run before
+    /// optimizations and before scheduling dirty tasks.
+    ///
+    /// The GC drain (`for_gc`, see [`Self::execute_until_rebalance`]) never balances, so it takes
+    /// removals regardless of pending balance jobs.
+    fn pop_job(&mut self, for_gc: bool) -> Option<AggregationUpdateJobItem> {
+        if let Some(job) = self.jobs.pop_front() {
+            return Some(job);
+        }
+        if self.aggregation_number_updates.is_empty() && (for_gc || self.balance_queue.is_empty()) {
+            return self.edge_removal_jobs.pop_front();
+        }
+        None
+    }
+
+    /// Whether [`Self::execute_until_rebalance`] has run everything it runs.
+    fn gc_drain_is_done(&self) -> bool {
+        self.jobs.is_empty()
+            && self.aggregation_number_updates.is_empty()
+            && self.edge_removal_jobs.is_empty()
+    }
+
+    /// Records a removal dispatch: whether it removed at least one edge (see
+    /// [`removal_progress`]), and the number of removals queued before it, including the
+    /// dispatched one. The dispatch may have requeued its removal split into several, so the
+    /// length after it doesn't tell. A streak without progress makes a back-off due.
+    fn record_removal_dispatch(&mut self, progress: bool, queued_before: usize) {
+        if progress {
+            self.record_other_work();
+        } else if let Some(delay) = self.removal_backoff.no_progress(queued_before) {
+            self.pending_removal_backoff = Some(delay);
+        }
+    }
+
+    /// Records work other than a removal, which may have added what a removal waits for.
+    fn record_other_work(&mut self) {
+        self.removal_backoff.progress();
+        self.pending_removal_backoff = None;
+    }
+
+    /// Takes the back-off due before running `job`: only before a removal, and never in the GC
+    /// drain (`for_gc`), which keeps today's behavior.
+    fn removal_backoff_before(
+        &mut self,
+        job: &AggregationUpdateJobItem,
+        for_gc: bool,
+    ) -> Option<Duration> {
+        if for_gc || !job.job.is_edge_removal() {
+            return None;
+        }
+        self.pending_removal_backoff.take()
+    }
+
+    /// Queues an aggregation number update, merging it into a queued update for the same task, and
+    /// dropping it when an update that was already done covers it.
+    fn push_aggregation_number_update(&mut self, task_id: TaskId, new: AggregationNumberUpdate) {
+        let AggregationNumberUpdate {
+            base_aggregation_number,
+            distance,
+            ..
+        } = new;
+        match self.aggregation_number_updates.entry(task_id) {
+            Entry::Occupied(mut entry) => {
+                let update = entry.get_mut();
+                update.base_aggregation_number =
+                    max(update.base_aggregation_number, base_aggregation_number);
+                if let Some(distance) = distance {
+                    if let Some(update_distance) = update.distance.as_mut() {
+                        *update_distance = max(*update_distance, distance);
+                    } else {
+                        update.distance = Some(distance);
+                    }
+                }
+            }
+            Entry::Vacant(entry) => {
+                match self.done_aggregation_number_updates.entry(task_id) {
+                    HashMapEntry::Occupied(mut entry) => {
+                        let update = entry.get_mut();
+                        let change = if update.base_aggregation_number < base_aggregation_number {
+                            true
+                        } else if let Some(distance) = distance {
+                            update.distance.is_none_or(|d| d < distance)
+                        } else {
+                            false
+                        };
+                        if !change {
+                            return;
+                        }
+                        entry.remove();
+                    }
+                    HashMapEntry::Vacant(_) => {}
+                }
+                entry.insert(new);
+            }
+        };
     }
 
     /// Extends the queue with multiple jobs.
@@ -1046,15 +1239,21 @@ impl AggregationUpdateQueue {
         task_id: TaskId,
         optimization_pending_flag_already_set: bool,
     ) -> bool {
+        self.try_enqueue_optimize_job_item(OptimizeJob::new(
+            task_id,
+            optimization_pending_flag_already_set,
+        ))
+    }
+
+    /// Like [`Self::try_enqueue_optimize_job`], for an existing job.
+    #[must_use = "if false, the caller must set `optimization_pending` to recover the drop"]
+    fn try_enqueue_optimize_job_item(&mut self, job: OptimizeJob) -> bool {
         if self.is_optimization_budget_exhausted()
             || self.optimize_queue.len() >= MAX_OPTIMIZE_QUEUE_SIZE
         {
             return false;
         }
-        self.optimize_queue.push_back(OptimizeJob::new(
-            task_id,
-            optimization_pending_flag_already_set,
-        ));
+        self.optimize_queue.push_back(job);
         true
     }
 
@@ -1119,10 +1318,12 @@ impl AggregationUpdateQueue {
         &mut self,
         ctx: &mut ExecuteContext<'_>,
     ) -> Vec<(TaskId, TaskId)> {
-        // `process` runs `jobs` and `aggregation_number_updates` before every other queue, so
-        // nothing below them has run yet when both are empty.
-        while !(self.jobs.is_empty() && self.aggregation_number_updates.is_empty()) {
-            self.process(ctx);
+        // `process_step` runs `jobs`, `aggregation_number_updates` and, in GC mode, edge removals
+        // before every other queue, so nothing below them has run yet when all three are empty.
+        // GC queues never fan out (see `new_without_optimizations`).
+        while !self.gc_drain_is_done() {
+            let job = self.pop_job(true);
+            self.process_step(ctx, job);
         }
         assert!(
             self.find_and_schedule.is_empty() && self.scheduled_tasks.is_empty(),
@@ -1163,7 +1364,158 @@ impl AggregationUpdateQueue {
 
     /// Executes a single step of the queue. Returns true, when the queue is empty.
     fn process(&mut self, ctx: &mut ExecuteContext<'_>) -> bool {
-        if let Some(job) = self.jobs.pop_front() {
+        if self.allow_fan_out
+            && self.jobs.len() >= JOB_FAN_OUT_THRESHOLD
+            && !ctx.has_gc_collectible()
+        {
+            self.fan_out(ctx);
+            self.record_other_work();
+            return false;
+        }
+        let job = self.pop_job(false);
+        let is_removal = match &job {
+            Some(job) => {
+                // Between steps: no task is locked here.
+                if let Some(delay) = self.removal_backoff_before(job, false) {
+                    backoff_sleep(delay);
+                }
+                job.job.is_edge_removal()
+            }
+            None => false,
+        };
+        let done = self.process_step(ctx, job);
+        if !is_removal && !done {
+            self.record_other_work();
+        }
+        done
+    }
+
+    /// Takes all queued `jobs` for [`Self::fan_out`], leaving every other kind of work queued,
+    /// including the edge removals.
+    fn take_jobs_for_fan_out(&mut self) -> Vec<AggregationUpdateJobItem> {
+        take(&mut self.jobs).into()
+    }
+
+    /// Runs all queued `jobs` in parallel, then queues the work they generated.
+    ///
+    /// Each chunk of jobs runs on a child context and pushes the work its jobs generate into a
+    /// buffer (see [`Self::buffer`]), which is never processed: a chunk runs exactly its jobs, once
+    /// each. After all chunks are done, the buffers are appended to this queue, which then
+    /// continues as usual, and may fan out again when the generated jobs are many.
+    ///
+    /// The jobs of a chunk never wait for each other or for work queued elsewhere. Edge removals,
+    /// the only jobs that wait for other work (see [`retry_loop`]), are not in `jobs`: they run one
+    /// at a time from `edge_removal_jobs` after this queue's `jobs`, aggregation number updates and
+    /// balancing, and never fan out. Removals generated by the chunks' jobs are buffered like all
+    /// other work. So this meets the requirement of `scope_bounded`, which runs the chunks on the
+    /// calling thread when no other thread is free.
+    ///
+    /// The jobs of one queue can run concurrently and in any order this way. That is no different
+    /// from the jobs of different queues, which already run concurrently: each job only locks the
+    /// tasks it changes.
+    ///
+    /// GC queues never fan out (see [`Self::new_without_optimizations`]), and neither do contexts
+    /// with a GC collectible callback, which child contexts don't carry over.
+    fn fan_out(&mut self, ctx: &mut ExecuteContext<'_>) {
+        let jobs = self.take_jobs_for_fan_out();
+        // Resolve the priority here: helper threads don't know the current task.
+        let child_ctx = ctx
+            .child_context()
+            .with_current_task_priority(ctx.get_current_task_priority());
+        let this = &*self;
+        let buffers: Vec<Self> = parallel::map_collect_chunked_owned(jobs, |chunk| {
+            let mut ctx = child_ctx.create();
+            let mut buffer = this.buffer();
+            for job in chunk {
+                buffer.process_step(&mut ctx, Some(job));
+            }
+            buffer
+        });
+        for buffer in buffers {
+            self.append_buffer_and_mark(ctx, buffer);
+        }
+    }
+
+    /// Appends a fan-out buffer (see [`Self::append_buffer`]) and sets `optimization_pending` on
+    /// the tasks of optimizations this queue refused, so they are recovered later.
+    fn append_buffer_and_mark(&mut self, ctx: &mut ExecuteContext<'_>, buffer: Self) {
+        for task_id in self.append_buffer(buffer) {
+            lock_and_mark_optimization_pending(ctx, task_id);
+        }
+    }
+
+    /// Appends all work of a fan-out buffer to this queue, deduplicated against the queued work.
+    ///
+    /// Returns the tasks of optimizations this queue refused (budget or queue size) whose
+    /// `optimization_pending` flag isn't known to be set already. The caller must set the flag on
+    /// them, as on any refused optimization.
+    fn append_buffer(&mut self, buffer: Self) -> Vec<TaskId> {
+        let Self {
+            jobs,
+            edge_removal_jobs,
+            aggregation_number_updates,
+            done_aggregation_number_updates,
+            find_and_schedule,
+            balance_queue,
+            optimize_queue,
+            optimizations_executed: _,
+            scheduled_tasks,
+            allow_fan_out: _,
+            // A buffer runs no removals.
+            removal_backoff: _,
+            pending_removal_backoff: _,
+            #[cfg(feature = "trace_aggregation_update_stats")]
+            stats,
+        } = buffer;
+        debug_assert!(
+            done_aggregation_number_updates.is_empty(),
+            "a fan-out buffer processes no aggregation number updates"
+        );
+        self.jobs.extend(jobs);
+        self.edge_removal_jobs.extend(edge_removal_jobs);
+        for (task_id, update) in aggregation_number_updates {
+            self.push_aggregation_number_update(task_id, update);
+        }
+        for job in balance_queue {
+            self.balance_queue.push_back(job);
+        }
+        for job in find_and_schedule {
+            self.find_and_schedule.push_back(job);
+        }
+        let mut needs_optimization_pending_flag = Vec::new();
+        for job in optimize_queue {
+            let task_id = job.task_id;
+            let flag_already_set = job.optimization_pending_flag_already_set;
+            if !self.try_enqueue_optimize_job_item(job) && !flag_already_set {
+                needs_optimization_pending_flag.push(task_id);
+            }
+        }
+        // A task is scheduled only once until it runs (`add_scheduled`), so keys rarely collide.
+        // When they do, keep the highest priority, so merging never delays a task.
+        for (task_id, priority) in scheduled_tasks {
+            self.scheduled_tasks
+                .entry(task_id)
+                .and_modify(|queued| *queued = max(*queued, priority))
+                .or_insert(priority);
+        }
+        #[cfg(feature = "trace_aggregation_update_stats")]
+        self.stats.add(stats);
+        needs_optimization_pending_flag
+    }
+
+    /// Executes a single step of the queue. Returns true, when the queue is empty.
+    ///
+    /// `job` is the next job taken by [`Self::pop_job`] (or, in a fan-out, one of the taken
+    /// `jobs`). When it's `Some`, this runs exactly that job and nothing else; the other kinds of
+    /// work only run once no job is due.
+    fn process_step(
+        &mut self,
+        ctx: &mut ExecuteContext<'_>,
+        job: Option<AggregationUpdateJobItem>,
+    ) -> bool {
+        if let Some(job) = job {
+            // For the back-off of removals: the removals queued before this one ran, including it.
+            let removals_before = self.edge_removal_jobs.len() + 1;
             let job: AggregationUpdateJobGuard = job.entered();
             match job.job {
                 AggregationUpdateJob::UpdateAggregationNumber { .. }
@@ -1312,7 +1664,9 @@ impl AggregationUpdateQueue {
                         self.stats.lost_followers += 1;
                         self.stats.inner_of_upper_lost_follower += 1;
                     }
-                    self.inner_of_upper_lost_follower(ctx, lost_follower_id, upper_id, retry);
+                    let progress =
+                        self.inner_of_upper_lost_follower(ctx, lost_follower_id, upper_id, retry);
+                    self.record_removal_dispatch(progress, removals_before);
                 }
                 AggregationUpdateJob::InnerOfUppersLostFollowers(boxed) => {
                     let InnerOfUppersLostFollowersJob {
@@ -1321,13 +1675,14 @@ impl AggregationUpdateQueue {
                     } = *boxed;
                     let uppers = upper_ids.len();
                     let followers = lost_follower_ids.len();
+                    let mut progress = false;
                     if uppers == 1 && followers == 1 {
                         #[cfg(feature = "trace_aggregation_update_stats")]
                         {
                             self.stats.lost_followers += 1;
                             self.stats.inner_of_upper_lost_follower += 1;
                         }
-                        self.inner_of_upper_lost_follower(
+                        progress = self.inner_of_upper_lost_follower(
                             ctx,
                             lost_follower_ids[0],
                             upper_ids[0],
@@ -1345,7 +1700,12 @@ impl AggregationUpdateQueue {
                                 self.stats.lost_followers += uppers;
                                 self.stats.inner_of_upper_lost_follower += 1;
                             }
-                            self.inner_of_uppers_lost_follower(ctx, lost_follower_id, upper_ids, 0);
+                            progress |= self.inner_of_uppers_lost_follower(
+                                ctx,
+                                lost_follower_id,
+                                upper_ids,
+                                0,
+                            );
                         }
                     } else {
                         while let Some(upper_id) = upper_ids.pop() {
@@ -1359,16 +1719,22 @@ impl AggregationUpdateQueue {
                                 self.stats.lost_followers += followers;
                                 self.stats.inner_of_upper_lost_followers += 1;
                             }
-                            self.inner_of_upper_lost_followers(ctx, lost_follower_ids, upper_id, 0);
+                            progress |= self.inner_of_upper_lost_followers(
+                                ctx,
+                                lost_follower_ids,
+                                upper_id,
+                                0,
+                            );
                         }
                     }
+                    self.record_removal_dispatch(progress, removals_before);
                 }
                 AggregationUpdateJob::InnerOfUppersLostFollower {
                     upper_ids,
                     lost_follower_id,
                     retry,
                 } => {
-                    if upper_ids.len() == 1 {
+                    let progress = if upper_ids.len() == 1 {
                         #[cfg(feature = "trace_aggregation_update_stats")]
                         {
                             self.stats.lost_followers += upper_ids.len();
@@ -1379,22 +1745,23 @@ impl AggregationUpdateQueue {
                             lost_follower_id,
                             upper_ids[0],
                             retry,
-                        );
+                        )
                     } else {
                         #[cfg(feature = "trace_aggregation_update_stats")]
                         {
                             self.stats.lost_followers += upper_ids.len();
                             self.stats.inner_of_uppers_lost_follower += 1;
                         }
-                        self.inner_of_uppers_lost_follower(ctx, lost_follower_id, upper_ids, retry);
-                    }
+                        self.inner_of_uppers_lost_follower(ctx, lost_follower_id, upper_ids, retry)
+                    };
+                    self.record_removal_dispatch(progress, removals_before);
                 }
                 AggregationUpdateJob::InnerOfUpperLostFollowers {
                     upper_id,
                     lost_follower_ids,
                     retry,
                 } => {
-                    if lost_follower_ids.len() == 1 {
+                    let progress = if lost_follower_ids.len() == 1 {
                         #[cfg(feature = "trace_aggregation_update_stats")]
                         {
                             self.stats.lost_followers += lost_follower_ids.len();
@@ -1405,15 +1772,16 @@ impl AggregationUpdateQueue {
                             lost_follower_ids[0],
                             upper_id,
                             retry,
-                        );
+                        )
                     } else {
                         #[cfg(feature = "trace_aggregation_update_stats")]
                         {
                             self.stats.lost_followers += lost_follower_ids.len();
                             self.stats.inner_of_upper_lost_followers += 1;
                         }
-                        self.inner_of_upper_lost_followers(ctx, lost_follower_ids, upper_id, retry);
-                    }
+                        self.inner_of_upper_lost_followers(ctx, lost_follower_ids, upper_id, retry)
+                    };
+                    self.record_removal_dispatch(progress, removals_before);
                 }
                 AggregationUpdateJob::AggregatedDataUpdate(AggregatedDataUpdateJob {
                     upper_ids,
@@ -1895,13 +2263,14 @@ impl AggregationUpdateQueue {
         );
     }
 
+    /// Returns whether the edge was removed, see [`removal_progress`].
     fn inner_of_upper_lost_follower(
         &mut self,
         ctx: &mut ExecuteContext<'_>,
         lost_follower_id: TaskId,
         upper_id: TaskId,
         mut retry: u16,
-    ) {
+    ) -> bool {
         #[cfg(feature = "trace_aggregation_update")]
         let _span = trace_span!("lost follower").entered();
 
@@ -2072,16 +2441,20 @@ impl AggregationUpdateQueue {
                 lost_follower_id,
                 retry,
             });
+            return false;
         }
+        true
     }
 
+    /// Returns whether at least one edge was removed, see [`removal_progress`].
     fn inner_of_uppers_lost_follower(
         &mut self,
         ctx: &mut ExecuteContext<'_>,
         lost_follower_id: TaskId,
         mut upper_ids: TaskIdVec,
         mut retry: u16,
-    ) {
+    ) -> bool {
+        let edges = upper_ids.len();
         #[cfg(feature = "trace_aggregation_update")]
         let _span = trace_span!("lost follower (n uppers)", uppers = upper_ids.len()).entered();
 
@@ -2262,21 +2635,26 @@ impl AggregationUpdateQueue {
                      they don't exist as upper or follower edges",
                 );
             }
+            let progress = removal_progress(edges, Some(upper_ids.len()));
             self.push(AggregationUpdateJob::InnerOfUppersLostFollower {
                 upper_ids,
                 lost_follower_id,
                 retry,
             });
+            return progress;
         }
+        true
     }
 
+    /// Returns whether at least one edge was removed, see [`removal_progress`].
     fn inner_of_upper_lost_followers(
         &mut self,
         ctx: &mut ExecuteContext<'_>,
         mut lost_follower_ids: TaskIdVec,
         upper_id: TaskId,
         mut retry: u16,
-    ) {
+    ) -> bool {
+        let edges = lost_follower_ids.len();
         #[cfg(feature = "trace_aggregation_update")]
         let _span = trace_span!(
             "lost follower (n follower)",
@@ -2458,12 +2836,15 @@ impl AggregationUpdateQueue {
                      don't exist as upper or follower edges",
                 )
             }
+            let progress = removal_progress(edges, Some(lost_follower_ids.len()));
             self.push(AggregationUpdateJob::InnerOfUpperLostFollowers {
                 upper_id,
                 lost_follower_ids,
                 retry,
             });
+            return progress;
         }
+        true
     }
 
     /// Batched version of `inner_of_upper_has_new_follower`.
@@ -3566,9 +3947,15 @@ const MAX_RETRIES: u16 = 60000;
 /// unable to remove the things it wants to remove (because they have not been added by the "add"
 /// update yet). So we will retry (with this method) removals until the thing is there. So this is
 /// basically a busy loop that waits for the "add" update to complete. If the busy loop is not
-/// successful, the update is added to the end of the queue again. This is important as the "add"
-/// update might even be in the current thread and in the same queue. If that's the case yielding
-/// won't help and the update need to be requeued.
+/// successful, the update is added to the end of the queue of edge removals again. This is
+/// important as the "add" update might even be in the current thread and in the same queue. If
+/// that's the case yielding won't help and the update need to be requeued. Edge removals only run
+/// after the other jobs, aggregation number updates and balancing of the queue, so a requeued
+/// removal doesn't keep work from running that may add what it wants to remove.
+///
+/// A queue with only removals left would take a requeued removal again right away, and so keep its
+/// thread busy while the awaited update runs elsewhere. [`RemovalBackoff`] makes such a queue sleep
+/// and hand its tokio worker to other tasks.
 fn retry_loop(mut retry: u16, mut f: impl FnMut() -> ControlFlow<()>) -> Result<(), RetryTimeout> {
     let mut time: Option<Instant> = None;
     loop {
@@ -3591,13 +3978,101 @@ fn retry_loop(mut retry: u16, mut f: impl FnMut() -> ControlFlow<()>) -> Result<
     }
 }
 
+/// Whether a removal dispatch made progress: it removed at least one of its `edges`.
+/// `requeued_remaining` is the number of edges it requeued, if any: removals of several edges
+/// requeue only the ones they couldn't remove.
+fn removal_progress(edges: usize, requeued_remaining: Option<usize>) -> bool {
+    match requeued_remaining {
+        None => true,
+        Some(remaining) => remaining < edges,
+    }
+}
+
+/// Backs off a queue whose edge removals make no progress.
+///
+/// The removals of a queue wait for updates that may run in other queues, on other threads, or in
+/// a fan-out of another queue (see [`AggregationUpdateQueue::fan_out`]). Many queues re-taking
+/// their requeued removals right away can occupy most tokio workers, so the helper tasks of a
+/// fan-out, and other tasks that would add the missing edges, get to run late. So after a streak of
+/// removal dispatches without progress, the queue sleeps (see [`backoff_sleep`]) before its next
+/// removal, and lets other tasks use its worker meanwhile.
+///
+/// The streak is `min(STREAK, queue length)` dispatches, the length taken when the streak starts:
+/// a full pass over a small queue, and at most [`Self::STREAK`] dispatches for a large one, where a
+/// full pass could take very long. The sleep doubles with each back-off up to [`Self::MAX_DELAY`],
+/// and progress (a removed edge, or any other work of the queue) resets it.
+///
+/// It only adds delay: a removal still fails after [`MAX_RETRIES`] requeues, which now may take
+/// longer.
+struct RemovalBackoff {
+    /// Dispatches without progress in the current streak.
+    streak: usize,
+    /// Length of the current streak, set when it starts.
+    streak_len: usize,
+    /// The next back-off.
+    delay: Duration,
+}
+
+impl Default for RemovalBackoff {
+    fn default() -> Self {
+        Self {
+            streak: 0,
+            streak_len: 0,
+            delay: Self::MIN_DELAY,
+        }
+    }
+}
+
+impl RemovalBackoff {
+    const STREAK: usize = 16;
+    const MIN_DELAY: Duration = Duration::from_micros(10);
+    const MAX_DELAY: Duration = Duration::from_millis(1);
+
+    /// A removal or other work made progress.
+    fn progress(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A removal dispatch made no progress, with `queued` removals queued before it (including
+    /// it). Returns the back-off to sleep before the next removal when the streak is complete.
+    fn no_progress(&mut self, queued: usize) -> Option<Duration> {
+        if self.streak == 0 {
+            self.streak_len = queued.clamp(1, Self::STREAK);
+        }
+        self.streak += 1;
+        if self.streak < self.streak_len {
+            return None;
+        }
+        self.streak = 0;
+        let delay = self.delay;
+        self.delay = (delay * 2).min(Self::MAX_DELAY);
+        Some(delay)
+    }
+}
+
+/// Sleeps for a [`RemovalBackoff`]. On a multi-threaded tokio runtime this happens in
+/// [`block_in_place`], so the worker's other tasks move to another thread meanwhile. Without a
+/// runtime, or on a current-thread runtime, where `block_in_place` isn't allowed, it just sleeps.
+fn backoff_sleep(delay: Duration) {
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            block_in_place(|| thread::sleep(delay));
+        }
+        _ => thread::sleep(delay),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rustc_hash::{FxHashMap, FxHashSet};
     use smallvec::{SmallVec, smallvec};
-    use turbo_tasks::{CellId, TaskId, TraitTypeId, ValueTypeId};
+    use turbo_tasks::{CellId, TaskId, TaskPriority, TraitTypeId, ValueTypeId};
 
-    use super::{AggregatedDataUpdate, sum_collectibles_update};
+    use super::{
+        AggregatedDataUpdate, AggregationUpdateJob, AggregationUpdateQueue,
+        MAX_OPTIMIZATIONS_PER_QUEUE, MAX_OPTIMIZE_QUEUE_SIZE, RemovalBackoff, backoff_sleep,
+        removal_progress, sum_collectibles_update,
+    };
     use crate::data::{CellRef, CollectibleRef};
 
     /// Models the collectibles part of `AggregatedDataUpdate::apply`: applies `update` to the
@@ -3825,5 +4300,606 @@ mod tests {
                 .is_empty()
         );
         assert!(AggregatedDataUpdate::new().optimize().is_empty());
+    }
+
+    fn task(id: u32) -> TaskId {
+        TaskId::new(id).unwrap()
+    }
+
+    fn job_upper_ids(queue: &AggregationUpdateQueue) -> Vec<u32> {
+        queue
+            .jobs
+            .iter()
+            .map(|item| match &item.job {
+                AggregationUpdateJob::InnerOfUpperHasNewFollowers { upper_id, .. } => **upper_id,
+                AggregationUpdateJob::InnerOfUpperLostFollower { upper_id, .. } => **upper_id,
+                job => panic!("unexpected job {job:?}"),
+            })
+            .collect()
+    }
+
+    fn new_followers(upper: u32) -> AggregationUpdateJob {
+        AggregationUpdateJob::InnerOfUpperHasNewFollowers {
+            upper_id: task(upper),
+            new_follower_ids: smallvec![task(1000)],
+        }
+    }
+
+    fn lost_follower(upper: u32) -> AggregationUpdateJob {
+        AggregationUpdateJob::InnerOfUpperLostFollower {
+            upper_id: task(upper),
+            lost_follower_id: task(1000),
+            retry: 0,
+        }
+    }
+
+    fn update_aggregation_number(task_id: u32, base: u32) -> AggregationUpdateJob {
+        AggregationUpdateJob::UpdateAggregationNumber {
+            task_id: task(task_id),
+            base_aggregation_number: base,
+            distance: None,
+        }
+    }
+
+    #[test]
+    fn fan_out_is_allowed_only_for_regular_queues() {
+        assert!(AggregationUpdateQueue::new().allow_fan_out);
+        assert!(!AggregationUpdateQueue::new_without_optimizations().allow_fan_out);
+        let parent = AggregationUpdateQueue::new();
+        assert!(!parent.buffer().allow_fan_out);
+    }
+
+    #[test]
+    fn push_routes_edge_removals_to_their_own_queue() {
+        let mut queue = AggregationUpdateQueue::new();
+        queue.push(new_followers(1));
+        queue.push(lost_follower(2));
+        queue.push(update_aggregation_number(3, 10));
+        queue.push(AggregationUpdateJob::BalanceEdge {
+            upper_id: task(4),
+            task_id: task(5),
+        });
+        assert_eq!(job_upper_ids(&queue), [1]);
+        assert_eq!(queue.edge_removal_jobs.len(), 1);
+        assert_eq!(queue.aggregation_number_updates.len(), 1);
+        assert_eq!(queue.balance_queue.len(), 1);
+        assert!(!queue.is_empty());
+    }
+
+    #[test]
+    fn edge_removals_run_after_jobs_aggregation_numbers_and_balance() {
+        let mut queue = AggregationUpdateQueue::new();
+        queue.push(lost_follower(2));
+        queue.push(new_followers(1));
+        queue.push(update_aggregation_number(3, 10));
+        queue.push(AggregationUpdateJob::BalanceEdge {
+            upper_id: task(4),
+            task_id: task(5),
+        });
+        assert!(queue.try_enqueue_optimize_job(task(6), false));
+        queue.push_find_and_schedule_dirty(task(7));
+
+        // `jobs` first, although the removal was pushed earlier.
+        let job = queue.pop_job(false).unwrap();
+        assert!(matches!(
+            job.job,
+            AggregationUpdateJob::InnerOfUpperHasNewFollowers { .. }
+        ));
+        // Aggregation number updates and balance jobs are pending: no removal yet.
+        assert!(queue.pop_job(false).is_none());
+        queue.aggregation_number_updates.clear();
+        assert!(queue.pop_job(false).is_none());
+        // GC never balances, so its drain takes removals anyway.
+        let mut gc_queue = AggregationUpdateQueue::new();
+        gc_queue.push(lost_follower(2));
+        gc_queue.push(AggregationUpdateJob::BalanceEdge {
+            upper_id: task(4),
+            task_id: task(5),
+        });
+        assert!(gc_queue.pop_job(true).is_some());
+        assert!(gc_queue.gc_drain_is_done());
+        // Balance done: the removal runs before optimize and find-and-schedule work.
+        queue.balance_queue.clear();
+        let job = queue.pop_job(false).unwrap();
+        assert!(matches!(
+            job.job,
+            AggregationUpdateJob::InnerOfUpperLostFollower { .. }
+        ));
+        assert!(queue.pop_job(false).is_none());
+        assert_eq!(queue.optimize_queue.len(), 1);
+        assert_eq!(queue.find_and_schedule.len(), 1);
+    }
+
+    #[test]
+    fn fan_out_never_takes_edge_removals() {
+        let mut queue = AggregationUpdateQueue::new();
+        queue.push(new_followers(1));
+        queue.push(lost_follower(2));
+        let taken = queue.take_jobs_for_fan_out();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(queue.edge_removal_jobs.len(), 1);
+    }
+
+    #[test]
+    fn append_buffer_moves_edge_removals_into_the_removal_queue() {
+        let mut parent = AggregationUpdateQueue::new();
+        parent.push(lost_follower(1));
+        let mut buffer = parent.buffer();
+        buffer.push(AggregationUpdateJob::InnerOfUpperLostFollower {
+            upper_id: task(2),
+            lost_follower_id: task(1000),
+            retry: 7,
+        });
+        assert!(parent.append_buffer(buffer).is_empty());
+        assert!(parent.jobs.is_empty());
+        let removals: Vec<(u32, u16)> = parent
+            .edge_removal_jobs
+            .iter()
+            .map(|item| match &item.job {
+                AggregationUpdateJob::InnerOfUpperLostFollower {
+                    upper_id, retry, ..
+                } => (**upper_id, *retry),
+                job => panic!("unexpected job {job:?}"),
+            })
+            .collect();
+        assert_eq!(removals, [(1, 0), (2, 7)]);
+    }
+
+    #[test]
+    fn default_queue_is_like_new() {
+        assert!(AggregationUpdateQueue::default().allow_fan_out);
+        assert!(AggregationUpdateQueue::default().is_empty());
+    }
+
+    fn micros(us: u64) -> std::time::Duration {
+        std::time::Duration::from_micros(us)
+    }
+
+    #[test]
+    fn removal_backoff_waits_for_a_streak_of_min_16_and_queue_length() {
+        let mut backoff = RemovalBackoff::default();
+        // A small queue backs off after a full pass.
+        assert_eq!(backoff.no_progress(3), None);
+        assert_eq!(backoff.no_progress(3), None);
+        assert_eq!(backoff.no_progress(3), Some(micros(10)));
+        // A large queue backs off after 16 dispatches. The length is taken when the streak
+        // starts.
+        for _ in 0..15 {
+            assert_eq!(backoff.no_progress(1_000_000), None);
+        }
+        assert_eq!(backoff.no_progress(1), Some(micros(20)));
+        // A streak has at least one dispatch.
+        assert_eq!(backoff.no_progress(0), Some(micros(40)));
+    }
+
+    #[test]
+    fn removal_backoff_doubles_up_to_1ms_and_resets_on_progress() {
+        let mut backoff = RemovalBackoff::default();
+        let delays: Vec<_> = (0..10).map(|_| backoff.no_progress(1).unwrap()).collect();
+        assert_eq!(
+            delays,
+            [10, 20, 40, 80, 160, 320, 640, 1000, 1000, 1000].map(micros)
+        );
+        backoff.progress();
+        assert_eq!(backoff.no_progress(1), Some(micros(10)));
+        // Progress in the middle of a streak restarts it.
+        assert_eq!(backoff.no_progress(3), None);
+        assert_eq!(backoff.no_progress(3), None);
+        backoff.progress();
+        assert_eq!(backoff.no_progress(3), None);
+        assert_eq!(backoff.no_progress(3), None);
+        assert_eq!(backoff.no_progress(3), Some(micros(10)));
+    }
+
+    #[test]
+    fn removal_progress_counts_partial_removals() {
+        // Nothing requeued: everything was removed.
+        assert!(removal_progress(5, None));
+        // Some removed, the rest requeued.
+        assert!(removal_progress(5, Some(3)));
+        // Nothing removed.
+        assert!(!removal_progress(5, Some(5)));
+    }
+
+    #[test]
+    fn queue_backs_off_only_before_removals_and_never_in_gc() {
+        let mut queue = AggregationUpdateQueue::new();
+        queue.push(lost_follower(2));
+        // One unproductive dispatch with one queued removal completes the streak.
+        queue.record_removal_dispatch(false, 1);
+        let removal = queue.pop_job(false).unwrap();
+        assert_eq!(queue.removal_backoff_before(&removal, true), None);
+        assert_eq!(
+            queue.removal_backoff_before(&removal, false),
+            Some(micros(10))
+        );
+        // Taken once.
+        assert_eq!(queue.removal_backoff_before(&removal, false), None);
+
+        // Never before other jobs, and other work resets the back-off.
+        queue.record_removal_dispatch(false, 1);
+        queue.push(new_followers(1));
+        let job = queue.pop_job(false).unwrap();
+        assert_eq!(queue.removal_backoff_before(&job, false), None);
+        queue.record_other_work();
+        assert_eq!(queue.removal_backoff_before(&removal, false), None);
+
+        // Progress resets it too.
+        queue.record_removal_dispatch(false, 1);
+        queue.record_removal_dispatch(true, 1);
+        assert_eq!(queue.removal_backoff_before(&removal, false), None);
+    }
+
+    #[test]
+    fn removal_backoff_uses_the_queue_length_before_the_dispatch() {
+        let mut queue = AggregationUpdateQueue::new();
+        // The dispatch of the only queued removal split it into three requeued removals, without
+        // progress. The streak length is the one removal queued before it.
+        for upper in 1..=3 {
+            queue.push(lost_follower(upper));
+        }
+        queue.record_removal_dispatch(false, 1);
+        let removal = queue.pop_job(false).unwrap();
+        assert_eq!(
+            queue.removal_backoff_before(&removal, false),
+            Some(micros(10))
+        );
+    }
+
+    /// The back-off sleep hands the worker to other tasks: with a single worker, a task spawned
+    /// while another task backs off completes during that back-off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn backoff_sleep_lets_other_tasks_run_on_the_worker() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let other_ran = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let sleeper = tokio::spawn({
+            let other_ran = other_ran.clone();
+            async move {
+                started_tx.send(()).unwrap();
+                // Test-only long duration, so the other task certainly gets a chance.
+                backoff_sleep(std::time::Duration::from_millis(500));
+                other_ran.load(Ordering::SeqCst)
+            }
+        });
+        started_rx.await.unwrap();
+        tokio::spawn({
+            let other_ran = other_ran.clone();
+            async move { other_ran.store(true, Ordering::SeqCst) }
+        });
+        assert!(
+            sleeper.await.unwrap(),
+            "the other task didn't run during the back-off"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backoff_sleep_works_on_a_current_thread_runtime() {
+        backoff_sleep(micros(10));
+    }
+
+    #[test]
+    fn backoff_sleep_works_without_a_runtime() {
+        backoff_sleep(micros(10));
+    }
+
+    #[test]
+    fn append_buffer_keeps_the_highest_scheduled_priority() {
+        // Higher in the parent, lower in the buffer.
+        let mut parent = AggregationUpdateQueue::new();
+        parent.scheduled_tasks.insert(task(1), TaskPriority::leaf());
+        let mut buffer = parent.buffer();
+        buffer
+            .scheduled_tasks
+            .insert(task(1), TaskPriority::initial());
+        assert!(parent.append_buffer(buffer).is_empty());
+        assert_eq!(parent.scheduled_tasks[&task(1)], TaskPriority::leaf());
+
+        // Lower in the parent, higher in the buffer.
+        let mut parent = AggregationUpdateQueue::new();
+        parent
+            .scheduled_tasks
+            .insert(task(1), TaskPriority::initial());
+        let mut buffer = parent.buffer();
+        buffer.scheduled_tasks.insert(task(1), TaskPriority::leaf());
+        assert!(parent.append_buffer(buffer).is_empty());
+        assert_eq!(parent.scheduled_tasks[&task(1)], TaskPriority::leaf());
+
+        // Across buffers: a later, lower one doesn't override an earlier, higher one.
+        let mut parent = AggregationUpdateQueue::new();
+        let mut first = parent.buffer();
+        first
+            .scheduled_tasks
+            .insert(task(1), TaskPriority::invalidation(1));
+        let mut second = parent.buffer();
+        second
+            .scheduled_tasks
+            .insert(task(1), TaskPriority::invalidation(3));
+        assert!(parent.append_buffer(first).is_empty());
+        assert!(parent.append_buffer(second).is_empty());
+        // `invalidation(1)` is the higher priority (`Reverse` order), as the runner pops the max.
+        assert!(TaskPriority::invalidation(1) > TaskPriority::invalidation(3));
+        assert_eq!(
+            parent.scheduled_tasks[&task(1)],
+            TaskPriority::invalidation(1)
+        );
+    }
+
+    #[test]
+    fn buffer_inherits_the_optimization_budget() {
+        let mut parent = AggregationUpdateQueue::new();
+        parent.optimizations_executed = 7;
+        let buffer = parent.buffer();
+        assert_eq!(buffer.optimizations_executed, 7);
+        assert!(buffer.is_empty());
+
+        // An exhausted parent yields a buffer that refuses optimizations, like the parent would.
+        parent.optimizations_executed = MAX_OPTIMIZATIONS_PER_QUEUE;
+        let mut buffer = parent.buffer();
+        assert!(!buffer.try_enqueue_optimize_job(task(1), false));
+        assert!(buffer.optimize_queue.is_empty());
+    }
+
+    #[test]
+    fn take_jobs_for_fan_out_takes_all_jobs_and_nothing_else() {
+        let mut queue = AggregationUpdateQueue::new();
+        queue.push(new_followers(1));
+        queue.push(lost_follower(2));
+        queue.push(new_followers(3));
+        queue.push(update_aggregation_number(4, 10));
+        queue.push(AggregationUpdateJob::BalanceEdge {
+            upper_id: task(5),
+            task_id: task(6),
+        });
+        queue.push_find_and_schedule_dirty(task(7));
+        assert!(queue.try_enqueue_optimize_job(task(8), false));
+        queue
+            .scheduled_tasks
+            .insert(task(9), TaskPriority::initial());
+
+        let taken = queue.take_jobs_for_fan_out();
+        let taken_uppers: Vec<u32> = taken
+            .iter()
+            .map(|item| match &item.job {
+                AggregationUpdateJob::InnerOfUpperHasNewFollowers { upper_id, .. } => **upper_id,
+                job => panic!("unexpected job {job:?}"),
+            })
+            .collect();
+        assert_eq!(taken_uppers, [1, 3]);
+        assert!(queue.jobs.is_empty());
+        assert_eq!(queue.edge_removal_jobs.len(), 1);
+        assert_eq!(queue.aggregation_number_updates.len(), 1);
+        assert_eq!(queue.balance_queue.len(), 1);
+        assert_eq!(queue.find_and_schedule.len(), 1);
+        assert_eq!(queue.optimize_queue.len(), 1);
+        assert_eq!(queue.scheduled_tasks.len(), 1);
+    }
+
+    #[test]
+    fn append_buffer_moves_all_work_into_the_queue() {
+        let mut parent = AggregationUpdateQueue::new();
+        parent.push(new_followers(1));
+        parent.push(AggregationUpdateJob::BalanceEdge {
+            upper_id: task(5),
+            task_id: task(6),
+        });
+        parent.push_find_and_schedule_dirty(task(7));
+        parent
+            .scheduled_tasks
+            .insert(task(9), TaskPriority::initial());
+
+        let mut buffer = parent.buffer();
+        buffer.push(lost_follower(2));
+        buffer.push(new_followers(3));
+        // Duplicates of work the parent already holds.
+        buffer.push(AggregationUpdateJob::BalanceEdge {
+            upper_id: task(5),
+            task_id: task(6),
+        });
+        buffer.push_find_and_schedule_dirty(task(7));
+        // New work.
+        buffer.push(AggregationUpdateJob::BalanceEdge {
+            upper_id: task(6),
+            task_id: task(5),
+        });
+        buffer.push_find_and_schedule_dirty(task(8));
+        buffer.push(update_aggregation_number(4, 10));
+        buffer
+            .scheduled_tasks
+            .insert(task(10), TaskPriority::leaf());
+
+        let needs_flag = parent.append_buffer(buffer);
+        assert!(needs_flag.is_empty());
+        // Jobs are appended after the parent's own jobs, in order; removals go to the removal
+        // queue.
+        assert_eq!(job_upper_ids(&parent), [1, 3]);
+        assert_eq!(parent.edge_removal_jobs.len(), 1);
+        assert_eq!(parent.balance_queue.len(), 2);
+        assert_eq!(parent.find_and_schedule.len(), 2);
+        assert_eq!(parent.aggregation_number_updates.len(), 1);
+        assert_eq!(parent.scheduled_tasks.len(), 2);
+        assert_eq!(parent.scheduled_tasks[&task(10)], TaskPriority::leaf());
+    }
+
+    #[test]
+    fn append_buffer_merges_aggregation_number_updates() {
+        let mut parent = AggregationUpdateQueue::new();
+        parent.push(update_aggregation_number(1, 10));
+        // Task 2 was already updated to 20 by the parent.
+        parent.push(update_aggregation_number(2, 20));
+        let (task_id, update) = parent.aggregation_number_updates.pop().unwrap();
+        parent
+            .done_aggregation_number_updates
+            .insert(task_id, update);
+
+        let mut buffer = parent.buffer();
+        // Merges with the queued update, keeping the maximum.
+        buffer.push(update_aggregation_number(1, 15));
+        // Dominated by the done update, so it is dropped.
+        buffer.push(update_aggregation_number(2, 20));
+        let mut buffer2 = parent.buffer();
+        // Larger than the done update, so it is queued again.
+        buffer2.push(update_aggregation_number(2, 25));
+
+        assert!(parent.append_buffer(buffer).is_empty());
+        assert_eq!(parent.aggregation_number_updates.len(), 1);
+        assert_eq!(
+            parent.aggregation_number_updates[&task(1)].base_aggregation_number,
+            15
+        );
+
+        assert!(parent.append_buffer(buffer2).is_empty());
+        assert_eq!(
+            parent.aggregation_number_updates[&task(2)].base_aggregation_number,
+            25
+        );
+        assert!(
+            !parent
+                .done_aggregation_number_updates
+                .contains_key(&task(2))
+        );
+    }
+
+    #[test]
+    fn append_buffer_merges_aggregation_number_distances() {
+        let with_distance = |task_id: u32, base: u32, distance: u32| {
+            AggregationUpdateJob::UpdateAggregationNumber {
+                task_id: task(task_id),
+                base_aggregation_number: base,
+                distance: std::num::NonZero::new(distance),
+            }
+        };
+        let mut parent = AggregationUpdateQueue::new();
+        parent.push(update_aggregation_number(1, 10));
+        // Task 2 was already updated, without a distance.
+        parent.push(update_aggregation_number(2, 20));
+        let (task_id, update) = parent.aggregation_number_updates.pop().unwrap();
+        parent
+            .done_aggregation_number_updates
+            .insert(task_id, update);
+
+        let mut buffer = parent.buffer();
+        // Adds a distance to the queued update.
+        buffer.push(with_distance(1, 10, 4));
+        // Same base as the done update, but a distance it didn't have: queued again.
+        buffer.push(with_distance(2, 20, 1));
+        assert!(parent.append_buffer(buffer).is_empty());
+        assert_eq!(
+            parent.aggregation_number_updates[&task(1)].distance,
+            std::num::NonZero::new(4)
+        );
+        assert_eq!(
+            parent.aggregation_number_updates[&task(2)].distance,
+            std::num::NonZero::new(1)
+        );
+
+        // A smaller distance doesn't lower the queued one.
+        let mut buffer = parent.buffer();
+        buffer.push(with_distance(1, 10, 2));
+        assert!(parent.append_buffer(buffer).is_empty());
+        assert_eq!(
+            parent.aggregation_number_updates[&task(1)].distance,
+            std::num::NonZero::new(4)
+        );
+    }
+
+    #[test]
+    fn append_buffer_returns_refused_optimizations_that_need_the_flag() {
+        let mut parent = AggregationUpdateQueue::new();
+        let mut buffer = parent.buffer();
+        assert!(buffer.try_enqueue_optimize_job(task(1), false));
+        assert!(buffer.try_enqueue_optimize_job(task(2), true));
+
+        // Under the cap: both are enqueued, keeping the flag snapshot.
+        assert!(parent.append_buffer(buffer).is_empty());
+        assert_eq!(parent.optimize_queue.len(), 2);
+        let flags: Vec<(u32, bool)> = parent
+            .optimize_queue
+            .iter()
+            .map(|job| (*job.task_id, job.optimization_pending_flag_already_set))
+            .collect();
+        assert_eq!(flags, [(1, false), (2, true)]);
+
+        // Budget exhausted after the buffer was created: the parent refuses them. Only the job
+        // whose flag isn't already set needs the flag.
+        let mut buffer = parent.buffer();
+        assert!(buffer.try_enqueue_optimize_job(task(3), false));
+        assert!(buffer.try_enqueue_optimize_job(task(4), true));
+        parent.optimizations_executed = MAX_OPTIMIZATIONS_PER_QUEUE;
+        assert_eq!(parent.append_buffer(buffer), [task(3)]);
+        assert_eq!(parent.optimize_queue.len(), 2);
+    }
+
+    #[test]
+    fn append_buffer_respects_the_optimize_queue_cap() {
+        let mut parent = AggregationUpdateQueue::new();
+        for i in 0..MAX_OPTIMIZE_QUEUE_SIZE as u32 {
+            assert!(parent.try_enqueue_optimize_job(task(i + 1), true));
+        }
+        let mut buffer = parent.buffer();
+        let first_new = MAX_OPTIMIZE_QUEUE_SIZE as u32 + 1;
+        assert!(buffer.try_enqueue_optimize_job(task(first_new), false));
+        assert!(buffer.try_enqueue_optimize_job(task(first_new + 1), true));
+        assert_eq!(parent.append_buffer(buffer), [task(first_new)]);
+        assert_eq!(parent.optimize_queue.len(), MAX_OPTIMIZE_QUEUE_SIZE);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn append_buffer_and_mark_sets_the_flag_of_refused_optimizations() {
+        use turbo_tasks::TurboTasks;
+
+        use crate::{
+            backend::{
+                BackendOptions, StorageMode, TaskDataCategory, TurboTasksBackend,
+                operation::ExecuteContext,
+            },
+            noop_backing_storage,
+        };
+
+        let tt = TurboTasks::new(TurboTasksBackend::new(
+            BackendOptions {
+                storage_mode: Some(StorageMode::ReadOnly),
+                num_workers: Some(1),
+                small_preallocation: true,
+                ..Default::default()
+            },
+            noop_backing_storage(),
+        ));
+        let storage = &tt.backend().storage;
+        for id in 1..=3 {
+            storage
+                .access_mut(task(id))
+                .flags
+                .set_restored(TaskDataCategory::All);
+        }
+        let flag = |id| {
+            storage
+                .with_task(task(id), |t| t.flags.optimization_pending())
+                .unwrap()
+        };
+
+        let mut ctx = ExecuteContext::new(tt.backend(), &tt);
+        // Accepted: queued, no flag.
+        let mut parent = AggregationUpdateQueue::new();
+        let mut buffer = parent.buffer();
+        assert!(buffer.try_enqueue_optimize_job(task(1), false));
+        parent.append_buffer_and_mark(&mut ctx, buffer);
+        assert_eq!(parent.optimize_queue.len(), 1);
+        assert!(!flag(1));
+
+        // Refused (budget exhausted): the flag is set, unless the job says it's already set.
+        let mut buffer = parent.buffer();
+        assert!(buffer.try_enqueue_optimize_job(task(2), false));
+        assert!(buffer.try_enqueue_optimize_job(task(3), true));
+        parent.optimizations_executed = MAX_OPTIMIZATIONS_PER_QUEUE;
+        parent.append_buffer_and_mark(&mut ctx, buffer);
+        drop(ctx);
+        assert_eq!(parent.optimize_queue.len(), 1);
+        assert!(flag(2));
+        // Not touched: the snapshot said it was set, so no lock is taken to set it again.
+        assert!(!flag(3));
     }
 }
