@@ -3,6 +3,12 @@ export default (req, res) => {
     try {
       res.setPreviewData(new Array(2000).fill('a').join(''))
     } catch (err) {
+      if (
+        !(err instanceof Error) ||
+        !/preview data.*limit.*\b2\s*kb\b/i.test(err.message)
+      ) {
+        throw err
+      }
       return res.status(500).end('too big')
     }
   } else {
