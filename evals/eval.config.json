@@ -60,5 +60,9 @@
     "skills": ["next-bundle-optimizer"],
     "publish": false,
     "timeout": 2700
+  },
+  "agent-059-browser-initial-load-optimizer": {
+    "skills": ["next-browser-initial-load-optimizer"],
+    "timeout": 1800
   }
 }
