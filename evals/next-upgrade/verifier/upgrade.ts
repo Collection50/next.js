@@ -1,12 +1,15 @@
 import { createRequire } from 'node:module'
-import { execFileSync, spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { promisify } from 'node:util'
 import { afterAll, beforeAll, expect, test, vi } from 'vitest'
 import {
   verifyBrowser,
   verifyHttp,
 } from '../apps/member-dashboard/behavior.spec'
+
+const execFileAsync = promisify(execFile)
 
 export function upgradeChecks(target: string): void {
   const app = process.env.NEXT_UPGRADE_VERIFY_APP
@@ -23,8 +26,9 @@ export function upgradeChecks(target: string): void {
     JSON.parse(readFileSync(join(app, 'package.json'), 'utf8'))
   const lockfile = () =>
     JSON.parse(readFileSync(join(app, 'package-lock.json'), 'utf8'))
-  const run = (cmd: string, args: string[], timeout: number) =>
-    execFileSync(cmd, args, {
+  // Builds must yield to the worker event loop so Vitest can service its RPCs.
+  const run = async (cmd: string, args: string[], timeout: number) => {
+    const { stdout } = await execFileAsync(cmd, args, {
       cwd: app,
       encoding: 'utf8',
       timeout,
@@ -35,6 +39,8 @@ export function upgradeChecks(target: string): void {
       },
       maxBuffer: 10 * 1024 * 1024,
     })
+    return stdout
+  }
   const check = (name: string, body: () => unknown | Promise<unknown>) => {
     test(
       name,
@@ -63,9 +69,13 @@ export function upgradeChecks(target: string): void {
   }
 
   // npm ci preserves the delivered lockfile. No agent-written script owns a gate.
-  beforeAll(() => {
+  beforeAll(async () => {
     try {
-      run('npm', ['ci', '--include=dev', '--no-audit', '--no-fund'], 300000)
+      await run(
+        'npm',
+        ['ci', '--include=dev', '--no-audit', '--no-fund'],
+        300000
+      )
     } catch (error) {
       installError = error instanceof Error ? error.message : String(error)
     }
@@ -90,24 +100,36 @@ export function upgradeChecks(target: string): void {
     expect(lock.packages['node_modules/next'].version).toBe(target)
     expect(installError).toBeNull()
   })
-  check('installed-version', () => {
+  check('installed-version', async () => {
     expect(installError).toBeNull()
     expect(
-      run('node', ['-p', "require('next/package.json').version"], 10000).trim()
+      (
+        await run('node', ['-p', "require('next/package.json').version"], 10000)
+      ).trim()
     ).toBe(target)
   })
-  check('typecheck', () => {
+  check('typecheck', async () => {
     expect(installError).toBeNull()
     expect(manifest().scripts.typecheck).toBeTruthy()
     const effective = JSON.parse(
-      run('node', ['node_modules/typescript/bin/tsc', '--showConfig'], 10000)
+      await run(
+        'node',
+        ['node_modules/typescript/bin/tsc', '--showConfig'],
+        10000
+      )
     )
     expect(effective.compilerOptions.noCheck === true).toBe(false)
     expect(effective.compilerOptions.strict).toBe(true)
     // showConfig lists roots only; imported app/lib files still belong to the
     // checked program and must count toward source coverage.
     const included = new Set(
-      run('node', ['node_modules/typescript/bin/tsc', '--listFilesOnly'], 90000)
+      (
+        await run(
+          'node',
+          ['node_modules/typescript/bin/tsc', '--listFilesOnly'],
+          90000
+        )
+      )
         .trim()
         .split(/\r?\n/)
         .map((file) => resolve(app, file))
@@ -129,10 +151,10 @@ export function upgradeChecks(target: string): void {
     }
     return run('node', ['node_modules/typescript/bin/tsc', '--noEmit'], 90000)
   })
-  check('build', () => {
+  check('build', async () => {
     expect(installError).toBeNull()
     expect(manifest().scripts.build).toBeTruthy()
-    const output = run(
+    const output = await run(
       'node',
       ['node_modules/next/dist/bin/next', 'build'],
       480000
