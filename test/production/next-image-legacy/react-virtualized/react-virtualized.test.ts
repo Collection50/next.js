@@ -10,7 +10,7 @@ describe('react-virtualized wrapping next/legacy/image', () => {
     files: __dirname,
     skipStart: true,
     dependencies: {
-      'react-virtualized': 'latest',
+      'react-virtualized': '9.22.6',
       'http-proxy': '1.18.1',
     },
   })
@@ -61,6 +61,9 @@ describe('react-virtualized wrapping next/legacy/image', () => {
       baseUrl: proxyPort,
       disableCache: true,
     })
+    expect(
+      await browser.elementByCss('img.large').getAttribute('src')
+    ).toContain('/_next/image?')
     expect(await getCancelCount()).toBe(0)
     await browser.eval('window.scrollTo({ top: 100, behavior: "smooth" })')
     await waitFor(100)
@@ -71,5 +74,8 @@ describe('react-virtualized wrapping next/legacy/image', () => {
     await browser.eval('window.scrollTo({ top: 300, behavior: "smooth" })')
     await waitFor(300)
     expect(await getCancelCount()).toBe(0)
+    expect(
+      await browser.elementByCss('img.large').getAttribute('src')
+    ).toContain('/_next/image?')
   })
 })
