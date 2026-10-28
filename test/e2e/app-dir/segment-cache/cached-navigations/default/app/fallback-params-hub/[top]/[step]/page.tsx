@@ -56,9 +56,22 @@ async function Hub({
           Fully static page with Partial Prefetching
         </LinkAccordion>
       </div>
+      <div>
+        <LinkAccordion
+          href={`/partial-prefetch-sync-io/${top}`}
+          prefetch={false}
+        >
+          Partial Prefetching with synchronous IO
+        </LinkAccordion>
+      </div>
+      <div>
+        <LinkAccordion href={`/full-prefetch-sync-io/${top}`} prefetch={false}>
+          Synchronous IO
+        </LinkAccordion>
+      </div>
       {top === 'time' ? (
         <LinkAccordion
-          href="/fully-static-params/time#full-prefetch"
+          href="/full-prefetch-sync-io/time#full-prefetch"
           prefetch={true}
         >
           Full prefetch

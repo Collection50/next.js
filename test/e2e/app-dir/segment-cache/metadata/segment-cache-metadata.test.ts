@@ -144,28 +144,50 @@ describe('segment cache (metadata)', () => {
     })
   })
 
-  // On the platform a cold ISR path is served from a completed static
-  // prerender that cannot vary on the request tree, so the page body is sent
-  // along with the head.
-  // @gate !deploy
-  it('requests only the head when the page segments are cached', async () => {
+  it.each([
+    {
+      name: 'serves complete cached RSC when a metadata-only navigation selects a fully static ISR entry',
+      route: 'page-with-per-tenant-head',
+      startPath: '/',
+      includesPage: true,
+    },
+    {
+      name: 'returns only the head when a metadata-only navigation selects a partially static ISR entry',
+      route: 'partial-page-with-per-tenant-head',
+      startPath: '/partial-page-with-per-tenant-head',
+      includesPage: false,
+    },
+  ])('$name', async ({ route, startPath, includesPage }) => {
     let act: ReturnType<typeof createRouterAct>
-    // The request tree of every navigation request (RSC requests that are
-    // not prefetches), decoded from its header.
+    // Record the request tree and payload for the unprefetched tenant.
     const navigationRequestTrees: Array<string | null> = []
-    const browser = await next.browser('/', {
+    const navigationResponses: Array<Promise<string>> = []
+    // Load the hub before prefetching to reuse its layout. The partial route's
+    // hub shares the layout that reads cookies.
+    const browser = await next.browser(startPath, {
       beforePageLoad(p: Playwright.Page) {
         act = createRouterAct(p)
         p.on('request', (request) => {
           const headers = request.headers()
           if (
             headers['rsc'] === '1' &&
-            headers[NEXT_ROUTER_PREFETCH_HEADER] === undefined
+            headers[NEXT_ROUTER_PREFETCH_HEADER] === undefined &&
+            new URL(request.url()).pathname === `/${route}/en/initech`
           ) {
             const encoded = headers[NEXT_ROUTER_STATE_TREE_HEADER]
             navigationRequestTrees.push(
               encoded === undefined ? null : decodeURIComponent(encoded)
             )
+          }
+        })
+        p.on('response', (response) => {
+          const request = response.request()
+          if (
+            request.headers().rsc === '1' &&
+            request.headers()[NEXT_ROUTER_PREFETCH_HEADER] === undefined &&
+            new URL(request.url()).pathname === `/${route}/en/initech`
+          ) {
+            navigationResponses.push(response.text())
           }
         })
       },
@@ -176,7 +198,7 @@ describe('segment cache (metadata)', () => {
     // only acme's head is cached.
     await act(async () => {
       const checkbox = await browser.elementByCss(
-        'input[data-link-accordion="/page-with-per-tenant-head/en/acme"]'
+        `input[data-link-accordion="/${route}/en/acme"]`
       )
       await checkbox.click()
     }, [{ includes: 'Locale: en' }, { includes: 'Tenant: acme' }])
@@ -185,25 +207,32 @@ describe('segment cache (metadata)', () => {
     // it. Its head is the only thing missing from the cache.
     await act(async () => {
       const checkbox = await browser.elementByCss(
-        'input[data-link-accordion="/page-with-per-tenant-head/en/initech"]'
+        `input[data-link-accordion="/${route}/en/initech"]`
       )
       await checkbox.click()
     }, 'no-requests')
 
-    // The navigation asks the server for the head alone. The response carries
-    // the new tenant's title and no page body.
-    await act(async () => {
-      const link = await browser.elementByCss(
-        'a[href="/page-with-per-tenant-head/en/initech"]'
-      )
-      await link.click()
-    }, [
-      { includes: 'Tenant: initech' },
-      { includes: 'Locale: en', block: 'reject' },
-    ])
+    // The client requests only the missing head.
+    // - Fully static entries supply their stored RSC payload.
+    // - Partial entries render the requested head.
+    await act(
+      async () => {
+        const link = await browser.elementByCss(
+          `a[href="/${route}/en/initech"]`
+        )
+        await link.click()
+      },
+      { includes: 'Tenant: initech' }
+    )
     expect(navigationRequestTrees).toEqual([METADATA_ONLY_REQUEST_TREE])
+    const payload = (await Promise.all(navigationResponses)).join('\n')
+    if (includesPage) {
+      expect(payload).toContain('Locale: en')
+    } else {
+      expect(payload).not.toContain('Locale: en')
+    }
 
-    // The body is the cached one, rendered under the new tenant's title.
+    // The page shows the same locale under the new tenant's title.
     const pageContent = await browser.elementById('target-page')
     expect(await pageContent.text()).toBe('Locale: en')
     await retry(async () => {

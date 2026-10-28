@@ -16,6 +16,7 @@ async function LayoutImpl({ children, params }: LayoutProps) {
     <html>
       <body>
         <div id="lang">{lang}</div>
+        <p id="root-rendered-at">{performance.now().toFixed(5)}</p>
         {children}
       </body>
     </html>

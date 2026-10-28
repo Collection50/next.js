@@ -84,7 +84,7 @@ describe('segment cache - vary params base dynamic', () => {
 
   const collectSegmentPrefetchResponses = async (
     href: string,
-    startPath: string = '/'
+    startPath: string = '/prefetch-hub'
   ) => {
     let act: ReturnType<typeof createRouterAct>
     const segmentPrefetchResponses: Array<Promise<SegmentPrefetchResponse>> = []

@@ -1,6 +1,9 @@
 import cheerio from 'cheerio'
 import { nextTestSetup } from 'e2e-utils'
 import { splitResponseWithPPRSentinel } from 'e2e-utils/ppr'
+import { randomUUID } from 'node:crypto'
+import { getRouteCacheKey } from 'next/dist/server/lib/route-cache-key'
+import { RouteKind } from 'next/dist/server/route-kind'
 
 // TODO(deploy-test-completion): Re-enable this suite in deploy mode.
 // The latest changes to support this behavior on deployed infra are available in the adapter,
@@ -38,6 +41,52 @@ describe('partial-fallback-root-blocking', () => {
       static$: cheerio.load(staticPart),
     }
   }
+
+  it('keeps root and non-root values correct across requests after a cold RSC navigation', async () => {
+    const lang = `navigation-${randomUUID()}`
+    const response = await next.fetch(`/${lang}/first`, {
+      headers: { rsc: '1' },
+    })
+    expect(response.status).toBe(200)
+    const body = await response.text()
+    expect(body).toContain(JSON.stringify({ id: 'lang', children: lang }))
+    expect(body).toContain(JSON.stringify({ id: 'slug', children: 'first' }))
+
+    let renderedAt: string | undefined
+    if (!isNextDeploy) {
+      // Read the entry before a document request can generate it.
+      const key = getRouteCacheKey(`/${lang}/[slug]`, {
+        kind: RouteKind.APP_PAGE,
+        sourceRoute: '/[lang]/[slug]/page',
+      })
+      const html = await next.readFile(`.next/server/${key}.html`)
+      const $ = cheerio.load(html)
+      expect($('#lang').text()).toBe(lang)
+      expect($('#slug').length).toBe(0)
+      expect($('#slug-fallback').text()).toBe('loading slug...')
+      renderedAt = $('#root-rendered-at').text()
+      expect(renderedAt).toMatch(/^\d+(?:\.\d+)?$/)
+    }
+    for (const slug of ['second', 'third']) {
+      const result = await fetchSplitHTML(`/${lang}/${slug}`)
+      const $ = cheerio.load(result.staticPart + result.dynamicPart)
+      expect($('#lang').text()).toBe(lang)
+      expect($('#slug').text()).toBe(slug)
+
+      // Unknown-root prelude assertions are excluded on deploy below until
+      // support for multiple fallback layers is verified there. The complete
+      // response must still contain the current root and slug in both modes.
+      if (!isNextDeploy) {
+        expect(result.static$('#lang').text()).toBe(lang)
+        expect(result.static$('#slug').length).toBe(0)
+        expect(result.static$('#slug-fallback').text()).toBe('loading slug...')
+        expect(result.dynamicPart).toContain(`<div id="slug">${slug}</div>`)
+        const marker = result.static$('#root-rendered-at').text()
+        expect(marker).toMatch(/^\d+(?:\.\d+)?$/)
+        expect(marker).toBe(renderedAt)
+      }
+    }
+  })
 
   // TODO: Re-enable once infra supports multiple layers of fallbacks
   if (!isNextDeploy) {

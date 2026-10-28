@@ -4,6 +4,9 @@ import { nextTestSetup } from 'e2e-utils'
 import { splitResponseWithPPRSentinel } from 'e2e-utils/ppr'
 import { retry, waitFor } from 'next-test-utils'
 import path from 'path'
+import { getRouteCacheKey } from 'next/dist/server/lib/route-cache-key'
+import { RouteKind } from 'next/dist/server/route-kind'
+import { createRouterAct } from 'router-act'
 
 type NextInstance = ReturnType<typeof nextTestSetup>['next']
 
@@ -30,6 +33,66 @@ function createSplitHTMLFetcher(next: NextInstance) {
   }
 }
 
+async function navigate(next: NextInstance, pathname: string, value: string) {
+  const response = await next.fetch(pathname, { headers: { rsc: '1' } })
+  expect(response.status).toBe(200)
+  expect(response.headers.get('content-type')).toContain('text/x-component')
+  expect(await response.text()).toContain(`"children":${JSON.stringify(value)}`)
+}
+
+async function expectClientParamsNavigation(next: NextInstance) {
+  for (const slug of ['first', 'second']) {
+    let act: ReturnType<typeof createRouterAct>
+    const documents: string[] = []
+    const responses: number[] = []
+    const target = `/client-params/${slug}`
+    const browser = await next.browser('/client-params', {
+      beforePageLoad(page) {
+        act = createRouterAct(page)
+        page.on('request', (request) => {
+          if (request.isNavigationRequest()) {
+            documents.push(new URL(request.url()).pathname)
+          }
+        })
+        page.on('response', (response) => {
+          const request = response.request()
+          if (
+            new URL(request.url()).pathname === target &&
+            request.headers().rsc
+          ) {
+            responses.push(response.status())
+          }
+        })
+      },
+    })
+    try {
+      await act(() => browser.elementById(`client-link-${slug}`).click())
+      expect(await browser.elementById('client-param').text()).toBe(slug)
+      expect(responses.length).toBeGreaterThan(0)
+      for (const status of responses) {
+        expect(status).toBe(200)
+      }
+      expect(documents).toEqual(['/client-params'])
+    } finally {
+      await browser.close()
+    }
+  }
+}
+
+async function waitForPrerender(
+  next: NextInstance,
+  pathname: string,
+  sourceRoute: string
+) {
+  const key = getRouteCacheKey(pathname, {
+    kind: RouteKind.APP_PAGE,
+    sourceRoute,
+  })
+  await retry(async () => {
+    expect(await next.hasFile(`.next/server/${key}.meta`)).toBe(true)
+  })
+}
+
 // The legacy Vercel builder does not implement the Cache Components shell
 // eligibility and upgrade behavior asserted here.
 // @force-gate !deploy || adapter
@@ -46,6 +109,63 @@ describe('partial-fallback-shell-upgrade', () => {
   }
 
   const fetchSplitHTML = createSplitHTMLFetcher(next)
+
+  it('navigates through a fully static fallback without a document reload when only a Client Component reads params', async () => {
+    await expectClientParamsNavigation(next)
+  })
+
+  // These assertions observe the navigation's upgrade without another request.
+  // @force-gate start
+  describe('navigation-triggered fallback upgrades', () => {
+    it('upgrades a shared fallback to a fully static route shell after a navigation', async () => {
+      const slug = `navigation-${randomUUID()}`
+      await navigate(next, `/${slug}`, slug)
+      await waitForPrerender(next, `/${slug}`, '/[slug]/page')
+      const result = await fetchSplitHTML(`/${slug}`)
+      expect(result.static$('#slug').text()).toBe(slug)
+      expect(result.static$('#fallback').length).toBe(0)
+    })
+
+    it('upgrades a prefix after a navigation and keeps the remaining param dynamic', async () => {
+      const one = `navigation-${randomUUID()}`
+      await navigate(next, `/prefix/${one}/first`, 'first')
+      await waitForPrerender(
+        next,
+        `/prefix/${one}/[two]`,
+        '/prefix/[one]/[two]/page'
+      )
+      const result = await fetchSplitHTML(`/prefix/${one}/second`)
+      expect(result.static$('#one').text()).toBe(one)
+      expect(result.static$('#two').length).toBe(0)
+      expect(result.static$('#two-fallback').text()).toBe('loading two...')
+      expect(result.dynamicPart).toContain('<div id="two">second</div>')
+      expect(result.dynamicPart).not.toContain('<div id="two">first</div>')
+    })
+
+    it('upgrades a required fallback after a navigation and keeps request-time content dynamic', async () => {
+      const bottom = `navigation-${randomUUID()}`
+      const pathname = `/mixed/short/${bottom}`
+      await navigate(next, pathname, bottom)
+      await waitForPrerender(next, pathname, '/mixed/[top]/[bottom]/page')
+      const result = await fetchSplitHTML(pathname)
+      expect(result.static$('#top').text()).toBe('short')
+      expect(result.static$('#bottom').text()).toBe(bottom)
+      expect(result.static$('#dynamic').length).toBe(0)
+      expect(result.dynamicPart).toContain(
+        '<div id="dynamic">Dynamic content</div>'
+      )
+    })
+  })
+
+  it('keeps a fallback shared after a navigation when no params are prerenderable', async () => {
+    await navigate(next, '/no-gsp/navigation-first', 'navigation-first')
+    for (const slug of ['navigation-first', 'navigation-second']) {
+      const result = await fetchSplitHTML(`/no-gsp/${slug}`)
+      expect(result.static$('#slug').length).toBe(0)
+      expect(result.static$('#fallback').text()).toBe('loading...')
+      expect(cheerio.load(result.dynamicPart)('#slug').text()).toBe(slug)
+    }
+  })
 
   it('should upgrade the fallback shell to a route shell', async () => {
     const pathname = '/two'
@@ -228,6 +348,49 @@ describe('partial-fallback-shell-upgrade - partialPrefetching disabled', () => {
   }
 
   const fetchSplitHTML = createSplitHTMLFetcher(next)
+
+  it('navigates through a fully static fallback without a document reload when only a Client Component reads params', async () => {
+    await expectClientParamsNavigation(next)
+  })
+
+  it('keeps a fallback shared after a navigation when Partial Prefetching is disabled', async () => {
+    const slug = `navigation-${randomUUID()}`
+    await navigate(next, `/${slug}`, slug)
+    for (const value of [slug, `${slug}-other`]) {
+      const result = await fetchSplitHTML(`/${value}`)
+      expect(result.static$('#slug').length).toBe(0)
+      expect(result.static$('#fallback').text()).toBe('loading...')
+      expect(cheerio.load(result.dynamicPart)('#slug').text()).toBe(value)
+    }
+  })
+
+  it('keeps a generic fallback shared after a navigation when Partial Prefetching is disabled', async () => {
+    const one = `navigation-${randomUUID()}`
+    await navigate(next, `/prefix/${one}/first`, 'first')
+    for (const two of ['first', 'second']) {
+      const result = await fetchSplitHTML(`/prefix/${one}/${two}`)
+      expect(result.static$('#one').length).toBe(0)
+      expect(result.static$('#two').length).toBe(0)
+      expect(result.static$('#one-fallback').text()).toBe('loading one...')
+      expect(result.dynamicPart).toContain(`<div id="one">${one}</div>`)
+      expect(result.dynamicPart).toContain(`<div id="two">${two}</div>`)
+    }
+  })
+
+  it('keeps a required fallback shared after a navigation when Partial Prefetching is disabled', async () => {
+    const bottom = `navigation-${randomUUID()}`
+    await navigate(next, `/mixed/short/${bottom}`, bottom)
+    for (const value of [bottom, `${bottom}-other`]) {
+      const result = await fetchSplitHTML(`/mixed/short/${value}`)
+      expect(result.static$('#top').text()).toBe('short')
+      expect(result.static$('#bottom').length).toBe(0)
+      expect(result.static$('#bottom-fallback').text()).toBe(
+        'loading bottom...'
+      )
+      expect(result.dynamicPart).toContain(`<div id="bottom">${value}</div>`)
+      expect(result.static$('#dynamic').length).toBe(0)
+    }
+  })
 
   it('should not upgrade the fallback shell to a route shell', async () => {
     const pathname = '/two'
@@ -506,6 +669,61 @@ describe('partial-fallback-shell-upgrade - partialPrefetching disabled', () => {
       expect(siblingResult.static$('#two').length).toBe(0)
       expect(siblingResult.dynamicPart).toContain('<div id="two">bar</div>')
       expect(siblingResult.dynamicPart).not.toContain('<div id="two">foo</div>')
+    })
+  })
+})
+
+// The custom ISR handler exercises the non-minimal next start cache path.
+// @force-gate start
+describe('static fallback navigations with a custom cache handler', () => {
+  describe.each([
+    ['enabled', 'default'],
+    ['disabled', 'partial-prefetching-disabled'],
+  ])('with Partial Prefetching %s', (_name, fixture) => {
+    const { next } = nextTestSetup({
+      files: path.join(__dirname, 'fixtures', fixture),
+      env: { FALLBACK_SHELL_CUSTOM_CACHE: '1' },
+    })
+
+    it('renders concrete params without marking a static fallback RSC payload as prerendered', async () => {
+      const slug = `custom-handler-${randomUUID()}`
+      const response = await next.fetch(`/client-params/${slug}`, {
+        headers: { rsc: '1' },
+      })
+      expect(response.status).toBe(200)
+      expect(response.headers.get('content-type')).toContain('text/x-component')
+      expect(await response.text()).not.toContain('%%drp:')
+      expect(response.headers.get('x-nextjs-prerender')).toBeNull()
+      await expectClientParamsNavigation(next)
+    })
+
+    it('renders concrete dynamic tail params from a generated shared shell instead of its placeholder RSC payload', async () => {
+      const one = `custom-shell-${randomUUID()}`
+      const initial = await next.fetch(`/client-tail-params/${one}/first`, {
+        headers: { rsc: '1' },
+      })
+      expect(initial.status).toBe(200)
+      expect(await initial.text()).not.toContain('%%drp:')
+      expect(initial.headers.get('x-nextjs-prerender')).toBeNull()
+
+      const key = getRouteCacheKey(`/client-tail-params/${one}/[two]`, {
+        kind: RouteKind.APP_PAGE,
+        sourceRoute: '/client-tail-params/[one]/[two]/page',
+      })
+      // Observe the cache write without a document request that could generate
+      // it.
+      await retry(() => {
+        expect(next.cliOutput).toContain(`cache-handler:set ${key}`)
+      })
+
+      const repeated = await next.fetch(`/client-tail-params/${one}/second`, {
+        headers: { rsc: '1' },
+      })
+      expect(repeated.status).toBe(200)
+      const body = await repeated.text()
+      expect(body).not.toContain('%%drp:')
+      expect(body).toContain('"k":"second"')
+      expect(repeated.headers.get('x-nextjs-prerender')).toBeNull()
     })
   })
 })

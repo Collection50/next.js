@@ -6,7 +6,7 @@ import type * as Playwright from 'playwright'
 import { createRouterAct } from 'router-act'
 
 describe('cached navigations', () => {
-  const { next, isNextDev, isNextDeploy } = nextTestSetup({
+  const { next, isNextDev } = nextTestSetup({
     files: path.join(__dirname, 'default'),
   })
 
@@ -443,7 +443,7 @@ describe('cached navigations', () => {
     }
   })
 
-  it('caches a fully static on-demand param for repeated navigations', async () => {
+  it('reuses a fully static on-demand prerender without requests on repeated navigations', async () => {
     const route = '/fully-static-params/t4'
     const startDate = Date.now()
     let page: Playwright.Page
@@ -489,38 +489,35 @@ describe('cached navigations', () => {
           .click()
         await browser.elementByCss(`a[href="${route}"]`).click()
       }
-      if (isNextDeploy) {
-        // The platform serves a completed static prerender, not an unmarked
-        // live-render prefix.
-        await act(navigate, 'no-requests')
-        expect(await browser.elementById('top').text()).toBe('Top: t4')
-        continue
-      }
-
-      await act(async () => {
-        await act(navigate, { includes: 'Top:', block: true })
-
-        // A live navigation response is marked partial even for a static
-        // page, so nothing from it was written into the cache.
-        expect(await browser.elementByCss('main').text()).not.toContain(
-          'Top: t4'
-        )
-      })
+      await act(navigate, 'no-requests')
       expect(await browser.elementById('top').text()).toBe('Top: t4')
     }
   })
 
-  it('does not cache synchronous IO after a novel param resolves', async () => {
-    const route = '/partial-fully-static-params/time'
-    if (isNextDeploy) {
-      // The platform must prerender this cold route before it can resume it.
-      // The prerender rejects the uncached timestamp instead of serving a
-      // cacheable result.
+  it.each(['/fully-static-params/time', '/partial-fully-static-params/time'])(
+    'rejects document requests when prerendering %s accesses uncached time',
+    async (route) => {
       const response = await next.fetch(route)
       expect(response.status).toBe(500)
       expect(await response.text()).not.toContain('Top: time')
-      return
     }
+  )
+
+  for (const route of [
+    '/fully-static-params/time',
+    '/partial-fully-static-params/time',
+  ]) {
+    // This checks blocking prerender failures in the self-hosted RSC path.
+    // @force-gate start
+    it(`rejects RSC requests when prerendering ${route} accesses uncached time`, async () => {
+      const response = await next.fetch(route, { headers: { rsc: '1' } })
+      expect(response.status).toBe(500)
+      expect(await response.text()).not.toContain('Top: time')
+    })
+  }
+
+  it('does not cache synchronous IO after a shared fallback resolves a novel param during navigation', async () => {
+    const route = '/partial-prefetch-sync-io/time'
     const hub = '/fallback-params-hub/time/a'
     let page: Playwright.Page
     const browser = await next.browser('/fallback-params-hub/time/start', {
@@ -530,31 +527,7 @@ describe('cached navigations', () => {
       },
     })
     const act = createRouterAct(page)
-
-    await act(
-      async () => {
-        await browser
-          .elementByCss(`input[data-link-accordion="${route}"]`)
-          .click()
-        await browser.elementByCss(`a[href="${route}"]`).click()
-      },
-      { includes: 'Top:' }
-    )
-    const timestamp = await browser.elementById('timestamp').text()
-    expect(timestamp).not.toBe('')
-
-    await act(
-      async () => {
-        await browser
-          .elementByCss(`input[data-link-accordion="${hub}"]`)
-          .click()
-        await browser.elementByCss(`a[href="${hub}"]`).click()
-      },
-      { includes: 'Fallback params hub a' }
-    )
-    await page.clock.fastForward(60_000)
-
-    await act(async () => {
+    try {
       await act(
         async () => {
           await browser
@@ -562,24 +535,46 @@ describe('cached navigations', () => {
             .click()
           await browser.elementByCss(`a[href="${route}"]`).click()
         },
-        { includes: 'Top:', block: true }
+        { includes: 'Top:' }
       )
+      const timestamp = await browser.elementById('timestamp').text()
+      expect(timestamp).toMatch(/^\d+$/)
 
-      expect(await browser.elementByCss('main').text()).not.toContain(
-        'Top: time'
+      await act(
+        async () => {
+          await browser
+            .elementByCss(`input[data-link-accordion="${hub}"]`)
+            .click()
+          await browser.elementByCss(`a[href="${hub}"]`).click()
+        },
+        { includes: 'Fallback params hub a' }
       )
-    })
-    expect(await browser.elementById('timestamp').text()).not.toBe(timestamp)
+      await page.clock.fastForward(60_000)
+
+      await act(async () => {
+        await act(
+          async () => {
+            await browser
+              .elementByCss(`input[data-link-accordion="${route}"]`)
+              .click()
+            await browser.elementByCss(`a[href="${route}"]`).click()
+          },
+          { includes: 'Top:', block: true }
+        )
+
+        const visibleText = await browser.eval('document.body.innerText')
+        expect(visibleText).toContain('Loading params...')
+        expect(visibleText).not.toContain('Top: time')
+        expect(visibleText).not.toContain(timestamp)
+      })
+      expect(await browser.elementById('timestamp').text()).not.toBe(timestamp)
+    } finally {
+      await browser.close()
+    }
   })
 
-  it('finishes a full prefetch after synchronous IO interrupts its shell', async () => {
-    const route = '/fully-static-params/time'
-    if (isNextDeploy) {
-      const response = await next.fetch(route)
-      expect(response.status).toBe(500)
-      return
-    }
-
+  it('finishes a full prefetch after synchronous IO interrupts a navigation through a shared fallback', async () => {
+    const route = '/full-prefetch-sync-io/time'
     let page: Playwright.Page
     const browser = await next.browser('/fallback-params-hub/time/start', {
       beforePageLoad(browserPage: Playwright.Page) {
@@ -596,7 +591,9 @@ describe('cached navigations', () => {
       },
       { includes: 'Top:' }
     )
+    expect(await browser.elementById('top').text()).toBe('Top: time')
     const timestamp = await browser.elementById('timestamp').text()
+    expect(timestamp).toMatch(/^\d+$/)
 
     const hub = '/fallback-params-hub/time/a'
     await act(
@@ -608,15 +605,13 @@ describe('cached navigations', () => {
       },
       { includes: 'Fallback params hub a' }
     )
-    await act(
-      async () => {
-        await browser.eval('window.next.router.refresh()')
-      },
-      { includes: 'Fallback params hub a' }
-    )
+    await act(() => browser.eval('window.next.router.refresh()'), {
+      includes: 'Fallback params hub a',
+    })
 
-    // Refresh clears segment data and BFCache but retains the route tree. The
-    // full prefetch must fetch new data without a cold static tree prerender.
+    // The loading boundary provides a shared fallback for the novel param.
+    // Refresh clears segment data but retains the route tree, so the full
+    // prefetch can request fresh runtime data for the same route.
     const fullPrefetchLink = `${route}#full-prefetch`
     await act(
       async () => {
@@ -626,10 +621,10 @@ describe('cached navigations', () => {
       },
       { includes: 'Top:' }
     )
-
-    await act(async () => {
-      await browser.elementByCss(`a[href="${fullPrefetchLink}"]`).click()
-    }, 'no-requests')
+    await act(
+      () => browser.elementByCss(`a[href="${fullPrefetchLink}"]`).click(),
+      'no-requests'
+    )
     expect(await browser.elementById('top').text()).toBe('Top: time')
     expect(await browser.elementById('timestamp').text()).not.toBe(timestamp)
   })
