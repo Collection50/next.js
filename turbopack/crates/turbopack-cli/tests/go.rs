@@ -37,18 +37,25 @@ impl Drop for Process {
 fn wait(condition: impl FnMut() -> bool) {
     wait_for("native build", condition);
 }
-fn wait_for(description: &str, mut condition: impl FnMut() -> bool) {
-    wait_for_timeout(description, Duration::from_secs(60), &mut condition);
+const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+fn wait_for(description: &str, condition: impl FnMut() -> bool) {
+    wait_for_timeout(description, WAIT_TIMEOUT, condition);
 }
-fn wait_for_timeout(description: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
+fn wait_for_timeout(description: &str, timeout: Duration, condition: impl FnMut() -> bool) {
+    assert!(
+        wait_until(timeout, condition),
+        "timed out waiting for {description}"
+    );
+}
+fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while !condition() {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {description}"
-        );
+        if Instant::now() >= deadline {
+            return false;
+        }
         thread::sleep(Duration::from_millis(100));
     }
+    true
 }
 
 #[test]
@@ -183,9 +190,11 @@ fn rejection(project: &Path, arguments: &[&str], diagnostic: &str) {
             .spawn()
             .unwrap(),
     );
-    wait_for("rejected CLI invocation", || {
-        process.0.try_wait().unwrap().is_some()
-    });
+    assert!(
+        wait_until(WAIT_TIMEOUT, || process.0.try_wait().unwrap().is_some()),
+        "timed out waiting for rejected CLI invocation {arguments:?}; stderr:\n{}",
+        std::fs::read_to_string(stderr.path()).unwrap()
+    );
     assert_eq!(process.0.wait().unwrap().code(), Some(1), "{arguments:?}");
     let error = std::fs::read_to_string(stderr.path()).unwrap();
     assert!(error.contains(diagnostic), "{arguments:?}: {error}");
@@ -865,12 +874,15 @@ fn cancellation_during_compilation_kills_child_processes() {
     assert!(go.status.success());
     let go = Path::new(String::from_utf8_lossy(&go.stdout).trim()).join("bin/go");
     let wrapper = project.join("go-wrapper");
+    let actions = tempfile::NamedTempFile::new().unwrap();
+    let stderr = tempfile::NamedTempFile::new().unwrap();
     let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = build ]; then\n sleep 120 &\n echo $! > {}\n touch {}\n \
-             wait\nfi\nexec {} \"$@\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> {}\nif [ \"$1\" = build ]; then\n sleep 120 &\n \
+             echo $! > {}\n touch {}\n wait\nfi\nexec {} \"$@\"\n",
+            quote(actions.path()),
             quote(&project.join("child.pid")),
             quote(&project.join("child.ready")),
             quote(&go)
@@ -883,13 +895,23 @@ fn cancellation_during_compilation_kills_child_processes() {
             .args(["build", "main.go", "--go"])
             .arg(&wrapper)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr.reopen().unwrap())
             .spawn()
             .unwrap(),
     );
-    wait_for("compiler descendant readiness", || {
-        project.join("child.ready").exists()
-    });
+    assert!(
+        wait_until(WAIT_TIMEOUT, || {
+            assert!(
+                process.0.try_wait().unwrap().is_none(),
+                "CLI exited before compiler descendant readiness; stderr:\n{}",
+                std::fs::read_to_string(stderr.path()).unwrap()
+            );
+            project.join("child.ready").exists()
+        }),
+        "timed out waiting for compiler descendant readiness; Go wrapper actions:\n{}\nstderr:\n{}",
+        std::fs::read_to_string(actions.path()).unwrap(),
+        std::fs::read_to_string(stderr.path()).unwrap()
+    );
     let pid = std::fs::read_to_string(project.join("child.pid")).unwrap();
     assert!(
         Command::new("/bin/kill")

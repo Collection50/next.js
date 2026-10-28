@@ -39,4 +39,7 @@ jobs:
           go-version: ${{ matrix.go }}
           cache: false
       - name: Test native Go bundles and CLI
+        env:
+          # Cases launch separate CLI processes and Go toolchains; bound contention during cold builds.
+          RUST_TEST_THREADS: 2
         run: cargo test -p turbopack-go -p turbopack-cli
