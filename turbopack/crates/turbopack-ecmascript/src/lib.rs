@@ -98,7 +98,7 @@ use turbopack_core::{
     compile_time_info::CompileTimeInfo,
     context::AssetContext,
     ident::AssetIdent,
-    module::{Module, ModuleSideEffects},
+    module::{Module, ModuleSideEffects, Modules},
     module_graph::ModuleGraph,
     reference::ModuleReferences,
     reference_type::InnerAssets,
@@ -800,6 +800,24 @@ impl EcmascriptModuleAsset {
     }
 }
 
+/// Hints that the parsed ASTs of the ecmascript modules in `modules` are no longer needed, see
+/// [`EcmascriptModuleAsset::drop_parse_result_hint`]. Other modules are ignored.
+///
+/// Typically called with [`ModuleGraph::unreachable_modules`], the modules that tree shaking
+/// removed: they are analyzed for code generation (which keeps their AST in memory for the code
+/// generation step), but are never code generated.
+#[turbo_tasks::function]
+pub async fn drop_parse_results_hint(modules: Vc<Modules>) -> Result<Vc<()>> {
+    modules
+        .await?
+        .iter()
+        .filter_map(|module| ResolvedVc::try_downcast_type::<EcmascriptModuleAsset>(*module))
+        .map(|module| (*module).drop_parse_result_hint())
+        .try_join()
+        .await?;
+    Ok(Vc::cell(()))
+}
+
 /// Computes a module's side effects from parse data only.
 ///
 /// This intentionally stays independent of [`EcmascriptModuleAsset::analyze`], since side-effect
@@ -864,6 +882,17 @@ impl EcmascriptModuleAsset {
             !options.analyze_mode.is_codegen,
             options.inline_helpers,
         ))
+    }
+
+    /// Hints that the parsed AST of this module is no longer needed and can be dropped, without
+    /// parsing the module if the AST isn't in memory.
+    ///
+    /// Code generation drops the AST via `final_read_hint` after its final read. Use this for
+    /// modules that will never be code generated, e.g. because tree shaking removed them.
+    pub async fn drop_parse_result_hint(self: Vc<Self>) -> Result<()> {
+        // Analysis and code generation read the AST through `failsafe_parse`, which is the result
+        // of `parse` unless the last successful parse is kept.
+        self.failsafe_parse().drop_content_hint().await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]

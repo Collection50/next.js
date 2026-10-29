@@ -1189,6 +1189,39 @@ impl TurboTasksBackend {
         Ok(ReadOutcome::Scheduled(listener))
     }
 
+    fn drop_cell_content_hint(&self, vc: RawVc, turbo_tasks: &TurboTasks<TurboTasksBackend>) {
+        let mut ctx = self.execute_context(turbo_tasks);
+        let mut current = vc;
+        // Follow the output chain only as far as it is already known. Never schedule, claim or
+        // wait for a task: this is only a memory hint.
+        loop {
+            match current.unpack() {
+                RawVcUnpacked::TaskOutput(task_id) => {
+                    let Some(task) = ctx.try_task(task_id, TaskDataCategory::Meta) else {
+                        return;
+                    };
+                    current = match task.get_output() {
+                        Some(OutputValue::Cell(cell)) => RawVc::task_cell(cell.task, cell.cell),
+                        Some(OutputValue::Output(task)) => RawVc::task_output(*task),
+                        Some(OutputValue::Error(_)) | None => return,
+                    };
+                }
+                RawVcUnpacked::TaskCell(task_id, cell) => {
+                    let Some(mut task) = ctx.try_task(task_id, TaskDataCategory::Data) else {
+                        return;
+                    };
+                    // Only drop the content. A later read will recompute the task, exactly like
+                    // after a `final_read_hint` read.
+                    let _ =
+                        task.remove_cell_data(&cell, &get_value_type(cell.type_id()).persistence);
+                    return;
+                }
+                // Local outputs are resolved by the caller, see `Vc::drop_content_hint`.
+                RawVcUnpacked::LocalOutput(..) => return,
+            }
+        }
+    }
+
     fn listen_to_cell(
         &self,
         task: &mut TaskGuard<'_>,
@@ -3955,6 +3988,10 @@ impl Backend for TurboTasksBackend {
         turbo_tasks: &TurboTasks<Self>,
     ) -> Result<TypedCellContent> {
         self.try_read_own_task_cell(task_id, cell, turbo_tasks)
+    }
+
+    fn drop_cell_content_hint(&self, vc: RawVc, turbo_tasks: &TurboTasks<Self>) {
+        self.drop_cell_content_hint(vc, turbo_tasks)
     }
 
     fn read_task_collectibles(

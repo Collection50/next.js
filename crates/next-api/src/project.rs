@@ -93,8 +93,9 @@ use turbopack_core::{
         NotFoundVersion, OptionVersionedContent, Update, Version, VersionState, VersionedContent,
     },
 };
-use turbopack_ecmascript::async_chunk::proxy::{
-    activation_key_from_chunk_path, lazy_compilation_state,
+use turbopack_ecmascript::{
+    async_chunk::proxy::{activation_key_from_chunk_path, lazy_compilation_state},
+    drop_parse_results_hint,
 };
 #[cfg(all(feature = "process_pool", not(target_family = "wasm")))]
 use turbopack_node::child_process_backend;
@@ -2748,11 +2749,28 @@ impl Project {
 
     #[turbo_tasks::function]
     pub async fn client_main_modules(self: Vc<Self>) -> Result<Vc<GraphEntries>> {
-        let pages_project = self.pages_project();
-        let mut chunk_groups = vec![ChunkGroupEntry::Entry {
-            modules: vec![pages_project.client_main_module().to_resolved().await?],
-            heuristics: EntryHeuristics::high_priority(),
-        }];
+        let mut chunk_groups = Vec::new();
+
+        // The Pages Router client runtime is only needed when Pages endpoints are emitted, which
+        // is exactly when `get_all_endpoint_groups` adds the `/_app` endpoint (i.e. there is at
+        // least one Pages Router route). Otherwise including it would pull the whole Pages
+        // Router client graph into the whole-app module graph for nothing.
+        let has_pages_entries = self
+            .get_all_endpoint_groups(false)
+            .await?
+            .iter()
+            .any(|(key, _)| matches!(key, EndpointGroupKey::PagesApp));
+        if has_pages_entries {
+            chunk_groups.push(ChunkGroupEntry::Entry {
+                modules: vec![
+                    self.pages_project()
+                        .client_main_module()
+                        .to_resolved()
+                        .await?,
+                ],
+                heuristics: EntryHeuristics::high_priority(),
+            });
+        }
 
         if let Some(app_project) = *self.app_project().await? {
             chunk_groups.push(ChunkGroupEntry::Entry {
@@ -2990,10 +3008,17 @@ async fn whole_app_module_graph_operation(
         let (full, binding_usage_info) = if turbopack_remove_unused_imports {
             let full_with_unused_references = ModuleGraph::from_graphs(graphs.clone(), None);
             let binding_usage_info = compute_binding_usage_info(full_with_unused_references, true);
-            (
-                ModuleGraph::from_graphs(graphs, Some(binding_usage_info)),
-                Some(binding_usage_info),
-            )
+            let full = ModuleGraph::from_graphs(graphs, Some(binding_usage_info));
+
+            // Modules removed by tree shaking were analyzed for code generation, which keeps
+            // their AST in memory until code generation consumes it. They are never code
+            // generated though, so drop their ASTs now instead of retaining them for the rest of
+            // the build.
+            drop_parse_results_hint(full.connect().unreachable_modules())
+                .as_side_effect()
+                .await?;
+
+            (full, Some(binding_usage_info))
         } else {
             (ModuleGraph::from_graphs(graphs, None), None)
         };

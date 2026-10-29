@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{Instrument, Level, Span};
 use turbo_rcstr::{RcStr, rcstr};
 use turbo_tasks::{
-    CollectiblesSource, FxIndexMap, JoinIterExt, NonLocalValue, OperationVc, ReadRef, ResolvedVc,
-    TryFlatJoinIterExt, TryJoinIterExt, ValueToString, Vc,
+    CollectiblesSource, FxIndexMap, FxIndexSet, JoinIterExt, NonLocalValue, OperationVc, ReadRef,
+    ResolvedVc, TryFlatJoinIterExt, TryJoinIterExt, ValueToString, Vc,
     debug::ValueDebugFormat,
     graph::{AdjacencyMap, GraphTraversal, Visit, VisitControlFlow},
     keyed::KeyedAccess,
@@ -31,7 +31,7 @@ use turbo_tasks_fs::FileSystemPath;
 use crate::{
     chunk::{AsyncModuleInfo, ChunkingContext, ChunkingType, TracedMode},
     issue::{ImportTracer, ImportTraces, Issue, IssueExt, IssueSeverity, analyze::AnalyzeIssue},
-    module::Module,
+    module::{Module, Modules},
     module_graph::{
         async_module_info::{AsyncModulesInfo, compute_async_module_info},
         binding_usage_info::{BindingUsageInfo, UnusedReferenceEdges},
@@ -847,6 +847,20 @@ impl ModuleGraph {
             },
         }
         .cell())
+    }
+
+    /// Returns the modules that are part of the graph, but are not reachable from its entries when
+    /// skipping unused references (i.e. modules removed by tree shaking) and traced references.
+    /// These modules are never chunked by a chunking context that uses this graph.
+    #[turbo_tasks::function]
+    pub async fn unreachable_modules(self: Vc<Self>) -> Result<Vc<Modules>> {
+        let graph = self.await?;
+        let reachable = graph.iter_reachable_modules()?.collect::<FxHashSet<_>>();
+        let unreachable = graph
+            .iter_nodes()
+            .filter(|module| !reachable.contains(module))
+            .collect::<FxIndexSet<_>>();
+        Ok(Vc::cell(unreachable.into_iter().collect()))
     }
 
     #[turbo_tasks::function]
