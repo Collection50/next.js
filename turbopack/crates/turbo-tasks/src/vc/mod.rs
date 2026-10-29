@@ -442,18 +442,18 @@ where
     /// Hint that the cell content this `Vc` points to is no longer needed, so it may be dropped to
     /// free memory. Future reads might need to recompute the value.
     ///
-    /// Unlike [`Vc::final_read_hint`] (or resolving `self`), this never reads the cell content and
-    /// never schedules or waits for any task (other than local outputs of the current task). Task
-    /// outputs are only followed as far as they are already known. If an output isn't available, or
-    /// the content isn't in memory (e.g. it was already dropped, or it was never computed
-    /// because its dependents were restored from a persistent cache), this does nothing.
+    /// This resolves `self` like [`Vc::to_resolved`] does (tracking the dependencies on task
+    /// outputs, and waiting for them if needed), but unlike [`Vc::final_read_hint`] it never reads
+    /// the cell content. If the content isn't present (e.g. it was already dropped, or it was never
+    /// computed because its dependents were restored from a persistent cache), this does nothing,
+    /// and in particular doesn't recompute it.
     ///
     /// This does not track any dependency on the cell.
     pub async fn drop_content_hint(self) -> Result<()> {
-        // Local outputs only exist within the current task, so this doesn't involve other tasks.
-        // It doesn't resolve task outputs.
-        let raw = self.node.to_non_local().await?;
-        crate::turbo_tasks().drop_cell_content_hint(raw);
+        let RawVcUnpacked::TaskCell(task, index) = self.node.resolve().await?.unpack() else {
+            unreachable!("resolve always returns a TaskCell");
+        };
+        crate::turbo_tasks().drop_task_cell_content_hint(task, index);
         Ok(())
     }
 

@@ -93,9 +93,8 @@ use turbopack_core::{
         NotFoundVersion, OptionVersionedContent, Update, Version, VersionState, VersionedContent,
     },
 };
-use turbopack_ecmascript::{
-    async_chunk::proxy::{activation_key_from_chunk_path, lazy_compilation_state},
-    drop_parse_results_hint,
+use turbopack_ecmascript::async_chunk::proxy::{
+    activation_key_from_chunk_path, lazy_compilation_state,
 };
 #[cfg(all(feature = "process_pool", not(target_family = "wasm")))]
 use turbopack_node::child_process_backend;
@@ -2756,7 +2755,7 @@ impl Project {
         // least one Pages Router route). Otherwise including it would pull the whole Pages
         // Router client graph into the whole-app module graph for nothing.
         let has_pages_entries = self
-            .get_all_endpoint_groups(false)
+            .get_all_endpoint_groups(/* app_dir_only */ false)
             .await?
             .iter()
             .any(|(key, _)| matches!(key, EndpointGroupKey::PagesApp));
@@ -2960,7 +2959,10 @@ async fn whole_app_module_graph_operation(
         let base = if turbopack_remove_unused_imports {
             // TODO suboptimal that we do compute_binding_usage_info twice (once for the base
             // graph and later for the full graph)
-            let binding_usage_info = compute_binding_usage_info(base, true);
+            let binding_usage_info = compute_binding_usage_info(
+                base, /* remove_unused_imports */ true,
+                /* drop_unused_module_data */ false,
+            );
             ModuleGraph::from_graphs(vec![base_single_module_graph], Some(binding_usage_info))
         } else {
             base
@@ -3007,18 +3009,18 @@ async fn whole_app_module_graph_operation(
 
         let (full, binding_usage_info) = if turbopack_remove_unused_imports {
             let full_with_unused_references = ModuleGraph::from_graphs(graphs.clone(), None);
-            let binding_usage_info = compute_binding_usage_info(full_with_unused_references, true);
-            let full = ModuleGraph::from_graphs(graphs, Some(binding_usage_info));
-
-            // Modules removed by tree shaking were analyzed for code generation, which keeps
-            // their AST in memory until code generation consumes it. They are never code
-            // generated though, so drop their ASTs now instead of retaining them for the rest of
-            // the build.
-            drop_parse_results_hint(full.connect().unreachable_modules())
-                .as_side_effect()
-                .await?;
-
-            (full, Some(binding_usage_info))
+            // This graph decides which modules are code generated, so modules that tree shaking
+            // removes are never code generated. Drop the data (e.g. ASTs) they only keep in memory
+            // for code generation.
+            let binding_usage_info = compute_binding_usage_info(
+                full_with_unused_references,
+                /* remove_unused_imports */ true,
+                /* drop_unused_module_data */ true,
+            );
+            (
+                ModuleGraph::from_graphs(graphs, Some(binding_usage_info)),
+                Some(binding_usage_info),
+            )
         } else {
             (ModuleGraph::from_graphs(graphs, None), None)
         };

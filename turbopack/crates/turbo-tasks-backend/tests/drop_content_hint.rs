@@ -3,7 +3,7 @@
 #![allow(clippy::needless_return)] // tokio macro-generated code doesn't respect this
 
 use std::{
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
 
@@ -25,7 +25,7 @@ async fn drop_content_hint() {
 
         // Dropping present content doesn't execute the task.
         drop_operation(2).read_strongly_consistent().await?;
-        // Dropping content that is not present anymore doesn't schedule the task either.
+        // Dropping content that is not present anymore doesn't recompute it either.
         drop_operation(3).read_strongly_consistent().await?;
         // Give a (wrongly) scheduled recomputation a chance to run.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -52,36 +52,6 @@ async fn drop_content_hint() {
     .unwrap()
 }
 
-static RELEASE_BLOCKED: AtomicBool = AtomicBool::new(false);
-static DROP_RETURNED: AtomicBool = AtomicBool::new(false);
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn drop_content_hint_does_not_wait_for_output() {
-    run_once_without_cache_check(&REGISTRATION, async {
-        // The output of `blocked` isn't available while it's running. Dropping must not wait
-        // for it (resolving it would). The strongly consistent read itself waits for `blocked`,
-        // so release `blocked` once the drop returned (or after a timeout, to not hang).
-        let read = drop_blocked_operation().read_strongly_consistent();
-        let release = async {
-            let returned = tokio::time::timeout(Duration::from_secs(10), async {
-                while !DROP_RETURNED.load(Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            })
-            .await;
-            RELEASE_BLOCKED.store(true, Ordering::SeqCst);
-            returned
-        };
-        let (read, returned) = tokio::join!(read, release);
-        read?;
-        returned.expect("drop_content_hint must not wait for the task output");
-
-        anyhow::Ok(())
-    })
-    .await
-    .unwrap()
-}
-
 /// Not serializable, so the content can't be restored from the persistent cache and must be
 /// recomputed after it has been dropped.
 #[turbo_tasks::value(serialization = "skip")]
@@ -97,14 +67,6 @@ fn compute() -> Vc<Content> {
 #[turbo_tasks::function]
 fn forward() -> Vc<Content> {
     compute()
-}
-
-#[turbo_tasks::function]
-async fn blocked() -> Result<Vc<Content>> {
-    while !RELEASE_BLOCKED.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    Ok(Content(1).cell())
 }
 
 /// `nonce` makes every call a new task, so that it actually reads the cell again. (It has to be
@@ -125,15 +87,6 @@ async fn drop_operation(nonce: u32) -> Result<Vc<()>> {
 #[turbo_tasks::function(operation, root)]
 async fn drop_through_output_operation(nonce: u32) -> Result<Vc<()>> {
     let _ = nonce;
-    // Make sure the output chain is known.
-    forward().await?;
     forward().drop_content_hint().await?;
-    Ok(Vc::cell(()))
-}
-
-#[turbo_tasks::function(operation, root)]
-async fn drop_blocked_operation() -> Result<Vc<()>> {
-    blocked().drop_content_hint().await?;
-    DROP_RETURNED.store(true, Ordering::SeqCst);
     Ok(Vc::cell(()))
 }
