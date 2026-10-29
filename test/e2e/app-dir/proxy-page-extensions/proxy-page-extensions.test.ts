@@ -1,6 +1,8 @@
 import { nextTestSetup } from 'e2e-utils'
 import { retry } from 'next-test-utils'
 
+// The instrumentation assertion reads local runtime logs.
+// @force-gate !deploy
 describe('proxy-page-extensions', () => {
   const { next } = nextTestSetup({
     files: __dirname,
