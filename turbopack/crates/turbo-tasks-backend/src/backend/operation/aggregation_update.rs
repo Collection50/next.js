@@ -46,7 +46,10 @@ use crate::{
         },
         storage_schema::TaskStorageAccessors,
     },
-    data::{ActivenessState, AggregationNumber, CollectibleRef, CollectiblesRef},
+    data::{
+        ActivenessState, AggregationNumber, CollectibleRef, CollectiblesRef, InProgressState,
+        InProgressStateInner,
+    },
     utils::swap_retain,
 };
 
@@ -1915,6 +1918,11 @@ impl AggregationUpdateQueue {
             );
             self.check_optimization_pending(&follower);
 
+            // Wait until a completing follower has propagated its edge changes
+            if is_completing_inner(&follower, upper_id) {
+                return ControlFlow::Continue(());
+            }
+
             // STEP 2
             let mut is_upper = true;
             let mut removed_upper = false;
@@ -2099,6 +2107,12 @@ impl AggregationUpdateQueue {
             let mut removed_uppers = SmallVec::new();
 
             swap_retain(&mut upper_ids, |&mut upper_id| {
+                // Wait until a completing follower has propagated its edge changes. Keeping the
+                // upper makes the follower edge check below fail too, so this is retried.
+                if is_completing_inner(&follower, upper_id) {
+                    return true;
+                }
+
                 let mut not_an_upper = false;
 
                 // STEP 3
@@ -2294,6 +2308,12 @@ impl AggregationUpdateQueue {
                     AGGREGATION_UPDATE_CATEGORY,
                 );
                 self.check_optimization_pending(&follower);
+
+                // Wait until a completing follower has propagated its edge changes. Keeping the
+                // follower makes the follower edge check below fail too, so this is retried.
+                if is_completing_inner(&follower, upper_id) {
+                    return true;
+                }
 
                 // STEP 2
                 let mut remove_upper = false;
@@ -3552,6 +3572,35 @@ impl TaskIdWithOptionalCount for (TaskId, u32) {
 
 struct RetryTimeout;
 
+/// Returns true when removing the upper edge from `follower` to `upper_id` has to wait, because it
+/// would remove the follower from the upper while the follower's completion is still running.
+///
+/// A completion changes the task's edges and propagates these changes to the uppers it saw at that
+/// time (e.g. that a removed child is no longer a follower). The task stays dirty until the
+/// completion is done, and that dirty state is what keeps these uppers from becoming clean before
+/// the changes reached them. Removing the last edge to an upper also removes the task's dirty state
+/// from the upper. A strongly consistent read of the upper could then complete while the upper
+/// still has the old data (e.g. collectibles of children that are no longer connected) or misses
+/// new data.
+///
+/// Only the completion is waited for, not the execution, so this never waits for user code or for
+/// other tasks to be executed. A waiting removal is requeued like other retries (see `retry_loop`),
+/// so the queue keeps processing its other jobs in the meantime. A completion can itself wait here
+/// for one of its followers' completions, but followers are always below the task in the task
+/// graph, so these waits can't form a cycle. Garbage collection runs at a boundary without active
+/// operations, so it never sees a completing task.
+fn is_completing_inner(follower: &TaskGuard<'_>, upper_id: TaskId) -> bool {
+    matches!(
+        follower.get_in_progress(),
+        Some(InProgressState::InProgress(InProgressStateInner {
+            completing: true,
+            ..
+        }))
+    ) && follower
+        .get_upper(&upper_id)
+        .is_some_and(|&count| count == 1)
+}
+
 const MAX_YIELD_DURATION: Duration = Duration::from_millis(1);
 const MAX_RETRIES: u16 = 60000;
 
@@ -3569,6 +3618,9 @@ const MAX_RETRIES: u16 = 60000;
 /// successful, the update is added to the end of the queue again. This is important as the "add"
 /// update might even be in the current thread and in the same queue. If that's the case yielding
 /// won't help and the update need to be requeued.
+///
+/// Removals also wait like this while the follower's completion is still running, see
+/// `is_completing_inner`.
 fn retry_loop(mut retry: u16, mut f: impl FnMut() -> ControlFlow<()>) -> Result<(), RetryTimeout> {
     let mut time: Option<Instant> = None;
     loop {

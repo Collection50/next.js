@@ -247,6 +247,12 @@ pub struct InProgressStateInner {
     /// Early marking as completed. This is set before the output is available and will ignore full
     /// task completion of the task for strongly consistent reads.
     pub marked_as_completed: bool,
+    /// Set once the execution has finished and its completion has started to change the task's
+    /// edges (removing old children, connecting new ones). These changes are propagated to the
+    /// uppers the task had at that time, while the task is still dirty. Until the completion is
+    /// done, an upper must not drop this task: that would drop the task's dirty contribution from
+    /// the upper, and the upper could become clean before the pending changes have reached it.
+    pub completing: bool,
     /// Event that is triggered when the task output is available (completed flag set).
     /// This is used to wait for completion when reading the task output before it's available.
     pub done_event: Event,

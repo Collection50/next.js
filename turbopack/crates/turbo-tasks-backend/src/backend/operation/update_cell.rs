@@ -400,6 +400,7 @@ mod invalidate_cell_dependents_tests {
                     once_task: false,
                     done_event: Event::new(|| || "test done_event".to_string()),
                     marked_as_completed: false,
+                    completing: false,
                     new_children: Default::default(),
                 },
             )));
